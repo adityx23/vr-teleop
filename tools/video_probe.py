@@ -1,7 +1,7 @@
 """
 Connect to a video server like the headset would and report frames per stream.
 
-    python tools/video_probe.py 192.168.123.116:8444 [--seconds 5] [--save-dir /tmp/frames]
+    python tools/video_probe.py 192.168.123.117:8444 [--seconds 5] [--save-dir /tmp/frames]
 
 Exits non-zero if no frames arrive. Skips TLS verification (self-signed cert).
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import aiohttp
 
-NAMES = {0: "head", 1: "gripper_left", 2: "gripper_right"}
+NAMES = {0: "head", 1: "gripper_left", 2: "gripper_right", 3: "head_stereo"}
 
 
 async def probe(host, seconds, save_dir):
@@ -32,6 +32,9 @@ async def probe(host, seconds, save_dir):
                     msg = await ws.receive(timeout=max(0.1, end - time.time()))
                 except asyncio.TimeoutError:
                     break
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    print("text message:", msg.data)  # e.g. stereo_info
+                    continue
                 if msg.type != aiohttp.WSMsgType.BINARY or len(msg.data) < 2:
                     continue
                 sid = msg.data[0]

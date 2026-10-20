@@ -5,11 +5,14 @@ a robot state snapshot, and returns the commands to send. The robot bridge
 calls it at a fixed rate (~30 Hz) and does the RPC.
 
 Controls (Quest Touch, WebXR "xr-standard" mapping):
+  A + X, tap          toggle teleop on/off (A on the right hand, X on the left,
+                      the lower face buttons). Starts OFF; while off nothing
+                      moves (arms hold, base stopped, neck holds).
+  A + X, hold 1.5 s   home both arms + neck, and turn teleop off
   grip (hold)         clutch that arm: while held, hand motion moves the arm;
                       release and the arm holds where it is
   index trigger       gripper close amount (0 open .. 1 closed), sent while clutched
-  B / Y               home that arm (only while not clutched)
-  A + X together      toggle base mode
+  B + Y together      toggle base mode (the upper face buttons)
   left stick          base vx / vy (base mode)
   right stick x       base yaw rate (base mode)
   left stick click    recenter the neck's "straight ahead"
@@ -80,11 +83,15 @@ class WholeBodyConfig:
     enable_neck: bool = True
     neck_pan_sign: float = 1.0  # +1: head turns left -> pan positive
     neck_tilt_sign: float = 1.0  # +1: head looks up -> tilt positive
+    neck_pan_offset_deg: float = 0.0  # neck pan that faces straight ahead (the neck's home pan)
     neck_tilt_offset_deg: float = 0.0  # neck tilt that points the camera at the horizon
     neck_limits_deg: dict = field(default_factory=lambda: {"pan": (-90.0, 90.0), "tilt": (-45.0, 45.0)})
     neck_max_speed_dps: float = 180.0
     # lift
     lift: LiftConfig = field(default_factory=LiftConfig)
+    # teleop on/off switch (A + X, one on each controller)
+    start_enabled: bool = False
+    home_hold_s: float = 1.5  # hold A + X this long to home everything
 
 
 # ------------------------------------------------------------------ helpers
@@ -164,7 +171,6 @@ class _ArmState:
         self.target_pos = None
         self.target_R = None
         self.last_seen_s = None
-        self.prev_secondary = False
         self.need_regrip = False  # set after tracking loss: grip must be released before re-clutching
 
 
@@ -175,13 +181,16 @@ class WholeBodyTeleop:
         self.arms = {side: _ArmState() for side in SIDES}
         self._filters = {name: PoseFilter(self.cfg.pose_filter_alpha) for name in ("head",) + SIDES}
         self.base_mode = False
-        self._prev_both_primary = False
+        self._prev_both_secondary = False
         self._prev_recenter = False
         self._neck_yaw0 = None
         self.neck_cmd = None  # {"pan", "tilt"} degrees, last commanded
         self.lift = LiftRetargeter(self.cfg.lift)
         self._last_now = None
         self.warnings = []
+        self.enabled = self.cfg.start_enabled
+        self._combo_start = None  # when A + X became held together
+        self._combo_fired = False  # the hold already fired "home" for this press
 
     # ------------------------------------------------------------ public API
     def update(self, payload, robot_state, now_s):
@@ -201,16 +210,43 @@ class WholeBodyTeleop:
         head = self._filtered("head", payload.get("head"))
         ctrls = {side: self._filtered(side, payload.get(side)) for side in SIDES}
 
-        commands = {"arms": {}, "home": [], "warnings": self.warnings}
+        home_all = False
+        event = self._update_enable_combo(ctrls["left"], ctrls["right"], now_s)
+        if event == "home":
+            self.set_enabled(False)
+            self._forget_targets()
+            home_all = True
+        elif event == "toggle":
+            self.set_enabled(not self.enabled)
+
+        commands = {"enabled": self.enabled, "home_all": home_all,
+                    "home": list(SIDES) if home_all else [], "arms": {}, "warnings": self.warnings}
         for side in SIDES:
-            commands["arms"][side] = self._update_arm(side, ctrls[side], head, robot_state, now_s, dt)
-            if self._home_pressed(side, ctrls[side]):
-                commands["home"].append(side)
+            if self.enabled:
+                commands["arms"][side] = self._update_arm(side, ctrls[side], head, robot_state, now_s, dt)
+            else:
+                commands["arms"][side] = {"clutched": False, "target": None, "gripper": None}
 
         commands["base_mode"], commands["base_velocity"] = self._update_base(ctrls)
         commands["neck"] = self._update_neck(head, ctrls["left"], robot_state, dt)
         commands["lift_target"] = self._update_lift(head, robot_state, dt)
         return commands
+
+    def set_enabled(self, on):
+        """Turn teleop on/off. Turning on re-zeros the neck at the current
+        heading and requires a fresh grip press, so nothing jumps."""
+        if on and not self.enabled:
+            self._neck_yaw0 = None
+            self.neck_cmd = None  # re-start from the measured neck pose
+            for side in SIDES:
+                self.arms[side].need_regrip = True
+        if not on:
+            for side in SIDES:
+                self._release(side)
+                self.arms[side].grip_held = False
+            self.base_mode = False
+            self.lift.reset()
+        self.enabled = bool(on)
 
     def release_all(self):
         """Connection lost / shutdown: unclutch everything, leave base mode."""
@@ -219,10 +255,14 @@ class WholeBodyTeleop:
             self.arms[side].grip_held = False
         self.base_mode = False
         self.lift.reset()
+        self._neck_yaw0 = None  # re-zero "straight ahead" when the headset reconnects
 
     def status(self):
         """HUD message for static/main.js handleTeleopState()."""
         clutched = {side: self.arms[side].clutched for side in SIDES}
+        if not self.enabled:
+            return {"type": "teleop_state", "state": "OFF", "enabled": False,
+                    "arm_enabled": clutched, "warnings": list(self.warnings)}
         modes = []
         if any(clutched.values()):
             modes.append("ARMS")
@@ -232,7 +272,8 @@ class WholeBodyTeleop:
             modes.append("LIFT")
         return {
             "type": "teleop_state",
-            "state": "+".join(modes) or "IDLE",
+            "state": "+".join(modes) or "ON",
+            "enabled": True,
             "arm_enabled": clutched,
             "warnings": list(self.warnings),
         }
@@ -351,24 +392,42 @@ class WholeBodyTeleop:
             rv *= max_angle / angle
         arm.target_R = arm.target_R @ quat.rotvec_to_matrix(rv)
 
-    def _home_pressed(self, side, ctrl):
-        arm = self.arms[side]
-        pressed, _ = _button(ctrl, SECONDARY_BUTTON)
-        edge = pressed and not arm.prev_secondary
-        arm.prev_secondary = pressed
-        if edge and not arm.clutched:
-            arm.target_pos = arm.target_R = None  # home moves the arm; forget the old target
-            return True
-        return False
+    def _forget_targets(self):
+        """Homing moves the arms and neck: drop remembered targets so the next
+        clutch anchors on the measured pose and the neck re-zeros."""
+        for side in SIDES:
+            self.arms[side].target_pos = self.arms[side].target_R = None
+        self.neck_cmd = None
+        self._neck_yaw0 = None
+
+    def _update_enable_combo(self, left, right, now_s):
+        """A + X (one per controller): tap -> "toggle" (on release), hold for
+        home_hold_s -> "home" (once per press). Returns None otherwise."""
+        if left is None or right is None:
+            return None  # tracking dropout mid-press: don't read it as a release
+        both = _button(left, PRIMARY_BUTTON)[0] and _button(right, PRIMARY_BUTTON)[0]
+        if both:
+            if self._combo_start is None:
+                self._combo_start, self._combo_fired = now_s, False
+            elif not self._combo_fired and now_s - self._combo_start >= self.cfg.home_hold_s:
+                self._combo_fired = True
+                return "home"
+            return None
+        if self._combo_start is not None:
+            fired = self._combo_fired
+            self._combo_start = None
+            if not fired:
+                return "toggle"
+        return None
 
     # ------------------------------------------------------------------ base
     def _update_base(self, ctrls):
         cfg = self.cfg
         left, right = ctrls["left"], ctrls["right"]
-        both = _button(left, PRIMARY_BUTTON)[0] and _button(right, PRIMARY_BUTTON)[0]
-        if both and not self._prev_both_primary and cfg.enable_base:
+        both = _button(left, SECONDARY_BUTTON)[0] and _button(right, SECONDARY_BUTTON)[0]  # B + Y
+        if both and not self._prev_both_secondary and cfg.enable_base and self.enabled:
             self.base_mode = not self.base_mode
-        self._prev_both_primary = both
+        self._prev_both_secondary = both
 
         if not self.base_mode:
             return False, [0.0, 0.0, 0.0]
@@ -386,7 +445,7 @@ class WholeBodyTeleop:
         recenter = _button(left, STICK_CLICK_BUTTON)[0]
         recenter_edge = recenter and not self._prev_recenter
         self._prev_recenter = recenter
-        if not cfg.enable_neck or head is None:
+        if not cfg.enable_neck or head is None or not self.enabled:
             return None
 
         yaw = _heading(head["R"])
@@ -396,7 +455,8 @@ class WholeBodyTeleop:
         pitch = math.asin(float(np.clip(f[1], -1.0, 1.0)))  # against the horizon, up positive
 
         lim = cfg.neck_limits_deg
-        pan = float(np.clip(cfg.neck_pan_sign * math.degrees(_wrap(yaw - self._neck_yaw0)), *lim["pan"]))
+        pan = float(np.clip(cfg.neck_pan_sign * math.degrees(_wrap(yaw - self._neck_yaw0)) + cfg.neck_pan_offset_deg,
+                            *lim["pan"]))
         tilt = float(np.clip(cfg.neck_tilt_sign * math.degrees(pitch) + cfg.neck_tilt_offset_deg, *lim["tilt"]))
 
         if self.neck_cmd is None:
@@ -415,6 +475,7 @@ class WholeBodyTeleop:
         clutched = [s for s in SIDES if self.arms[s].clutched]
         arm_z = [float(self.arms[s].target_pos[2]) for s in clutched]
         head_y = None if head is None else float(head["pos"][1])
-        target = self.lift.update(bool(clutched), head_y, arm_z, robot_state.get("lift_height"), dt)
+        target = self.lift.update(bool(clutched) and self.enabled, head_y, arm_z,
+                                  robot_state.get("lift_height"), dt)
         self.warnings.extend(self.lift.warnings)
         return target

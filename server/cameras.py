@@ -12,8 +12,18 @@ camera_config.example.json and docs/ORIN_VIDEO_SERVER.md):
   {"type": "stub"}                                      placeholder "NO SIGNAL" frames
   {"type": "opencv", "device": "/dev/video0" | 0}       V4L2 webcam / USB camera
   {"type": "zed", "serial": null, "view": "left"}       ZED via pyzed (opens the camera itself)
-Common options: "width", "height", "fps", "jpeg_quality".
+  {"type": "zed", "view": "side_by_side"}               ZED stereo: rectified left|right in one
+                                                        frame, for the "head_stereo" stream
+Common options: "width", "height", "fps", "jpeg_quality". For side_by_side,
+width/height are per eye (the frame is 2*width wide).
 A source that fails to open falls back to stub frames, labelled with the reason.
+
+Stereo: a "head_stereo" source also produces calibration for the frames it
+sends, which every client receives as a JSON text message
+  {"type": "stereo_info", "stream": 3, "width", "height" (per eye, px),
+   "fx", "fy", "cx", "cy" (px, at that size), "baseline_m", "model"}
+on connect (and again if it changes). The headset uses it to show the view
+at true scale, left image to the left eye and right image to the right eye.
 """
 import asyncio
 import json
@@ -28,7 +38,7 @@ import numpy as np
 
 log = logging.getLogger("vr_teleop.cameras")
 
-STREAM_IDS = {"head": 0, "gripper_left": 1, "gripper_right": 2}
+STREAM_IDS = {"head": 0, "gripper_left": 1, "gripper_right": 2, "head_stereo": 3}
 
 DEFAULTS = {"width": 640, "height": 480, "fps": 20, "jpeg_quality": 70}
 STUB_FPS = 2  # placeholder frames are static, no need to push them fast
@@ -38,6 +48,7 @@ DEFAULT_CONFIG = {
     "head": {"type": "opencv", "device": 0},
     "gripper_left": {"type": "stub"},
     "gripper_right": {"type": "stub"},
+    "head_stereo": {"type": "none"},
 }
 
 
@@ -48,7 +59,8 @@ def load_config(path=None):
     unknown = set(cfg) - set(STREAM_IDS)
     if unknown:
         raise ValueError(f"unknown stream(s) {sorted(unknown)}; valid: {sorted(STREAM_IDS)}")
-    return {name: cfg.get(name, {"type": "stub"}) for name in STREAM_IDS}
+    # head_stereo is optional: absent means no stereo stream (the headset shows mono "head").
+    return {name: cfg.get(name, {"type": "none" if name == "head_stereo" else "stub"}) for name in STREAM_IDS}
 
 
 def _encode(frame, quality) -> bytes:
@@ -107,10 +119,35 @@ class ZedSource:
         err = self.cam.open(init)
         if err != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"ZED open failed: {err}")
-        self.view = sl.VIEW.RIGHT if opts.get("view") == "right" else sl.VIEW.LEFT
+        view = opts.get("view", "left")
+        self.stereo = view == "side_by_side"
+        self.view = {"left": sl.VIEW.LEFT, "right": sl.VIEW.RIGHT, "side_by_side": sl.VIEW.SIDE_BY_SIDE}[view]
         self.mat = sl.Mat()
-        self.size = (int(opts["width"]), int(opts["height"]))
-        self.desc = f"zed:{opts.get('serial') or 'default'}:{opts.get('view', 'left')}"
+        w, h = int(opts["width"]), int(opts["height"])
+        self.size = (2 * w, h) if self.stereo else (w, h)
+        self.desc = f"zed:{opts.get('serial') or 'default'}:{view}"
+        self.stereo_info = self._stereo_info(w, h) if self.stereo else None
+
+    def _stereo_info(self, w, h):
+        """Rectified left-camera intrinsics scaled to the streamed per-eye size."""
+        info = self.cam.get_camera_information()
+        cfg = getattr(info, "camera_configuration", info)  # SDK 4 nests it; SDK 3 doesn't
+        calib = cfg.calibration_parameters
+        left = calib.left_cam
+        native_w = getattr(cfg, "resolution", None)
+        native_w, native_h = (native_w.width, native_w.height) if native_w is not None else (left.image_size.width,
+                                                                                               left.image_size.height)
+        sx, sy = w / native_w, h / native_h
+        try:
+            baseline = calib.get_camera_baseline()  # in InitParameters.coordinate_units (default mm)
+        except AttributeError:
+            baseline = abs(calib.stereo_transform.get_translation().get()[0])
+        baseline_m = baseline / 1000.0 if baseline > 1.0 else baseline
+        return {
+            "type": "stereo_info", "stream": STREAM_IDS["head_stereo"], "width": w, "height": h,
+            "fx": left.fx * sx, "fy": left.fy * sy, "cx": left.cx * sx, "cy": left.cy * sy,
+            "baseline_m": baseline_m, "model": str(getattr(info, "camera_model", "ZED")),
+        }
 
     def read(self):
         if self.cam.grab() != self.sl.ERROR_CODE.SUCCESS:
@@ -140,6 +177,7 @@ class MultiCameraStreamer:
         self.stats = {name: {"source": None, "frames": 0, "fps": 0.0, "error": None} for name in STREAM_IDS}
         self.stats_dropped = 0
         self._pending = {}  # (id(ws), stream_id) -> future of the in-flight send
+        self.stereo_info = None  # set once a head_stereo source opens
         self._threads = [
             threading.Thread(target=self._run, args=(name, {**DEFAULTS, **self.config.get(name, {})}), daemon=True)
             for name in STREAM_IDS
@@ -148,6 +186,9 @@ class MultiCameraStreamer:
     def add_client(self, ws):
         with self._clients_lock:
             self._clients.add(ws)
+            info = self.stereo_info
+        if info is not None:
+            asyncio.run_coroutine_threadsafe(self._safe_send_text(ws, json.dumps(info)), self._loop)
 
     def remove_client(self, ws):
         with self._clients_lock:
@@ -171,6 +212,9 @@ class MultiCameraStreamer:
     # ------------------------------------------------------------- workers
     def _run(self, name, opts):
         kind = opts.get("type", "stub")
+        if kind == "none":
+            self.stats[name]["source"] = "none"
+            return
         if kind == "stub":
             self._run_stub(name, opts, f"{name} (stub)")
             return
@@ -184,6 +228,11 @@ class MultiCameraStreamer:
 
         self.stats[name]["source"] = source.desc
         log.info("%s: %s opened, target %s fps", name, source.desc, opts["fps"])
+        info = getattr(source, "stereo_info", None)
+        if info is not None:
+            log.info("%s: stereo calibration %s", name, info)
+            self.stereo_info = info
+            self._broadcast_text(json.dumps(info))
         period = 1.0 / opts["fps"]
         window_start, window_frames = time.time(), 0
         try:
@@ -229,6 +278,20 @@ class MultiCameraStreamer:
                     self.stats_dropped += 1
                     continue
                 self._pending[key] = asyncio.run_coroutine_threadsafe(self._safe_send(ws, payload), self._loop)
+
+    def _broadcast_text(self, text: str):
+        with self._clients_lock:
+            clients = list(self._clients)
+        for ws in clients:
+            asyncio.run_coroutine_threadsafe(self._safe_send_text(ws, text), self._loop)
+
+    @staticmethod
+    async def _safe_send_text(ws, text: str):
+        try:
+            if not ws.closed:
+                await ws.send_str(text)
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     async def _safe_send(ws, data: bytes):

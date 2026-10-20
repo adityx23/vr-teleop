@@ -6,14 +6,24 @@ const statusEl = document.getElementById("status");
 // ---------- WebSockets ----------
 // Control socket: always the server that served this page (the robot Pi).
 //   pose data out every XR frame, teleop_state JSON (HUD) in.
-// Video socket: optional, a separate camera server (the Orin), given as
-//   ?video=<host:port>, e.g. https://192.168.123.55:8443/?video=192.168.123.116:8444
+// Video socket: optional, a separate camera server (the Orin). Its host:port
+//   comes from ?video=<host:port> if given (?video=none turns video off),
+//   otherwise from the serving server's /config.json default.
 //   Binary frames in only. Its TLS cert must have been accepted once by
 //   visiting https://<host:port>/ directly, or the socket fails silently.
 // Either socket also accepts binary frames, so a single server that does both
 // (server.py --cameras on a dev PC) still works without ?video=.
 const wsProto = location.protocol === "https:" ? "wss" : "ws";
-const videoHost = new URLSearchParams(location.search).get("video");
+let videoHost = new URLSearchParams(location.search).get("video");
+if (videoHost === null) {
+  try {
+    videoHost = (await (await fetch("/config.json")).json()).video || null;
+  } catch (e) {
+    videoHost = null; // older server without /config.json
+  }
+} else if (videoHost === "" || videoHost === "none") {
+  videoHost = null;
+}
 
 const links = {
   control: { url: `${wsProto}://${location.host}/ws`, ws: null, state: "connecting" },
@@ -27,12 +37,13 @@ let lastVideoFrameTime = 0;
 
 function setStatus() {
   const c = links.control.state;
-  let v = "none (no ?video=)";
+  let v = "off";
   if (links.video) {
     v = links.video.state === "open" ? `${fps} fps` : links.video.state;
     if (links.video.state === "error") v += ` -- accept the cert at https://${videoHost}/`;
   }
-  statusEl.textContent = `control: ${c} | video: ${v}`;
+  const ipd = ipdMm === null ? "" : ` | IPD ${ipdMm.toFixed(1)} mm${stereoActive() ? " (stereo)" : ""}`;
+  statusEl.textContent = `control: ${c} | video: ${v}${ipd}`;
 }
 
 function connect(name) {
@@ -52,6 +63,7 @@ function connect(name) {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === "teleop_state") handleTeleopState(msg);
+        if (msg.type === "stereo_info") handleStereoInfo(msg);
       } catch (e) {
         // ignore malformed status message
       }
@@ -103,6 +115,12 @@ async function handleFrame(buffer) {
   const bytes = new Uint8Array(buffer);
   if (bytes.length < 2) return;
   const streamId = bytes[0];
+  if (streamId === STEREO_STREAM_ID) {
+    framesReceived++;
+    lastVideoFrameTime = performance.now();
+    handleStereoFrame(bytes.subarray(1));
+    return;
+  }
   const entry = streamCanvases[streamId];
   if (!entry) return;
 
@@ -188,13 +206,154 @@ const HEAD_SCREEN_OFFSET = new THREE.Vector3(0, -0.05, -1.2);
 const LEFT_GRIPPER_OFFSET = new THREE.Vector3(-0.45, -0.3, -1.0);
 const RIGHT_GRIPPER_OFFSET = new THREE.Vector3(0.45, -0.3, -1.0);
 
+// ---------- Stereo ZED view (stream 3: rectified left|right side by side) ----------
+// Each eye gets its own head-locked plane showing its half of the frame:
+// three.js's WebXR left-eye camera renders layer 1 only, the right-eye camera
+// layer 2 only. Each plane is centred in front of its eye (planes ipd apart),
+// sized from the ZED calibration so the view is true scale in angle: an object
+// at infinity (zero disparity) lands straight ahead of each eye.
+// IPD: right stick up/down adjusts it (not in base mode), right stick click
+// resets to the headset's own measured IPD; remembered on this headset;
+// ?ipd=<mm> in the URL sets it.
+const STEREO_STREAM_ID = 3;
+const STEREO_DISTANCE = 3.0; // m; any distance works -- angular size is what's matched
+const IPD_MIN_MM = 40;
+const IPD_MAX_MM = 90;
+const IPD_RATE_MM_S = 8; // at full stick deflection
+const IPD_STORAGE_KEY = "vrteleop.ipd_mm";
+
+// Until the video server sends calibration: ZED 2 at HD720 (fx ~ 530 px at 1280x720).
+let stereoInfo = { width: 1280, height: 720, fx: 530, fy: 530, cx: 640, cy: 360, baseline_m: 0.12, model: "default" };
+let lastStereoFrameTime = 0;
+
+const stereoCanvas = document.createElement("canvas");
+stereoCanvas.width = 2 * stereoInfo.width;
+stereoCanvas.height = stereoInfo.height;
+const stereoCtx = stereoCanvas.getContext("2d");
+const stereoTexture = new THREE.CanvasTexture(stereoCanvas);
+stereoTexture.colorSpace = THREE.SRGBColorSpace;
+
+function makeEyePlane(layer, u0) {
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setX(i, u0 + 0.5 * uv.getX(i)); // this eye's half
+  uv.needsUpdate = true;
+  // Background: drawn first with no depth test, so HUD, insets and controllers draw over it.
+  const mat = new THREE.MeshBasicMaterial({ map: stereoTexture, depthTest: false, depthWrite: false });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.layers.set(layer);
+  mesh.visible = false;
+  mesh.renderOrder = -1;
+  scene.add(mesh);
+  return mesh;
+}
+const leftEyePlane = makeEyePlane(1, 0.0);
+const rightEyePlane = makeEyePlane(2, 0.5);
+
+function handleStereoInfo(msg) {
+  stereoInfo = msg;
+  console.log("stereo_info", msg);
+}
+
+async function handleStereoFrame(jpegBytes) {
+  try {
+    const bitmap = await createImageBitmap(new Blob([jpegBytes], { type: "image/jpeg" }));
+    if (stereoCanvas.width !== bitmap.width || stereoCanvas.height !== bitmap.height) {
+      stereoCanvas.width = bitmap.width;
+      stereoCanvas.height = bitmap.height;
+      stereoTexture.dispose(); // reallocate at the new size
+    }
+    stereoCtx.drawImage(bitmap, 0, 0);
+    stereoTexture.needsUpdate = true;
+    bitmap.close();
+    lastStereoFrameTime = performance.now();
+  } catch (e) {
+    // ignore malformed frame
+  }
+}
+
+function stereoActive() {
+  return performance.now() - lastStereoFrameTime < 1000;
+}
+
+// --- IPD setting
+let measuredIpdMm = null; // from the headset's own eye poses
+let ipdMm = null;
+let ipdShownUntil = 0;
+let ipdSaveTimer = null;
+{
+  const fromUrl = parseFloat(new URLSearchParams(location.search).get("ipd"));
+  let stored = NaN;
+  try {
+    stored = parseFloat(localStorage.getItem(IPD_STORAGE_KEY));
+  } catch (e) {
+    // storage unavailable: fall back to the headset's measured IPD
+  }
+  if (Number.isFinite(fromUrl)) ipdMm = fromUrl;
+  else if (Number.isFinite(stored)) ipdMm = stored;
+}
+
+function setIpd(mm, show = true) {
+  ipdMm = Math.min(IPD_MAX_MM, Math.max(IPD_MIN_MM, mm));
+  if (show) {
+    ipdShownUntil = performance.now() + 2000;
+    refreshHud();
+  }
+  clearTimeout(ipdSaveTimer);
+  ipdSaveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(IPD_STORAGE_KEY, ipdMm.toFixed(1));
+    } catch (e) {
+      // not persisted; still applies for this session
+    }
+  }, 500);
+}
+
+let prevIpdReset = false;
+function updateIpdFromStick(rightGamepad, dtS) {
+  if (!rightGamepad) return;
+  const inBaseMode = !!(lastTeleopState && String(lastTeleopState.state).includes("BASE"));
+  const reset = !!(rightGamepad.buttons[3] && rightGamepad.buttons[3].pressed);
+  if (reset && !prevIpdReset && measuredIpdMm !== null) setIpd(measuredIpdMm);
+  prevIpdReset = reset;
+  if (inBaseMode) return;
+  const y = rightGamepad.axes.length >= 4 ? rightGamepad.axes[3] : 0;
+  if (Math.abs(y) < 0.3) return;
+  // stick forward (y < 0) -> wider
+  const v = (Math.abs(y) - 0.3) / 0.7;
+  setIpd(ipdMm - Math.sign(y) * v * IPD_RATE_MM_S * dtS);
+}
+
+const eyeOffset = new THREE.Vector3();
+function placeEyePlanes(headPos, headQuat) {
+  const on = stereoActive();
+  leftEyePlane.visible = rightEyePlane.visible = on;
+  headScreen.visible = !on;
+  floorGrid.visible = !on; // the grid would cut through the video
+  if (!on) return;
+  const { width: W, height: H, fx, fy, cx, cy } = stereoInfo;
+  const D = STEREO_DISTANCE;
+  const w = (D * W) / fx;
+  const h = (D * H) / fy;
+  const ox = (D * (W / 2 - cx)) / fx; // principal point offset (image y is down)
+  const oy = (D * (cy - H / 2)) / fy;
+  const half = (ipdMm ?? 63) / 2000; // m
+  for (const [mesh, side] of [[leftEyePlane, -1], [rightEyePlane, 1]]) {
+    mesh.scale.set(w, h, 1);
+    mesh.quaternion.copy(headQuat);
+    eyeOffset.set(side * half + ox, oy, -D).applyQuaternion(headQuat);
+    mesh.position.copy(headPos).add(eyeOffset);
+  }
+}
+
 function headLock(mesh, offset, headPos, headQuat) {
   mesh.quaternion.copy(headQuat);
   mesh.position.copy(offset).applyQuaternion(headQuat).add(headPos);
 }
 
 // Simple floor grid for spatial reference
-scene.add(new THREE.GridHelper(6, 12, 0x3a4a5a, 0x222a33));
+const floorGrid = new THREE.GridHelper(6, 12, 0x3a4a5a, 0x222a33);
+scene.add(floorGrid);
 
 // ---------- Controllers ----------
 function makeControllerMesh(color) {
@@ -313,13 +472,26 @@ function handleTeleopState(msg) {
     }
   }
 
-  const l = msg.arm_enabled.left ? "ON" : "off";
-  const r = msg.arm_enabled.right ? "ON" : "off";
-  const color = msg.warnings && msg.warnings.length ? "#ff5555" : "#eeeeee";
-  const video = videoOk() ? "" : "  NO VIDEO";
-  drawHud(`${msg.state}  L:${l}  R:${r}${video}`, color);
-
   lastTeleopState = msg;
+  refreshHud();
+}
+
+function refreshHud() {
+  const msg = lastTeleopState;
+  let text = "STATE: --";
+  let color = "#aaaaaa";
+  if (msg) {
+    const l = msg.arm_enabled.left ? "ON" : "off";
+    const r = msg.arm_enabled.right ? "ON" : "off";
+    color = msg.warnings && msg.warnings.length ? "#ff5555" : "#eeeeee";
+    text = `${msg.state}  L:${l}  R:${r}`;
+  }
+  if (!videoOk()) text += "  NO VIDEO";
+  if (performance.now() < ipdShownUntil && ipdMm !== null) {
+    text = `IPD ${ipdMm.toFixed(1)} mm`;
+    color = "#66ccff";
+  }
+  drawHud(text, color);
 }
 
 // ---------- Pose extraction + send loop ----------
@@ -342,7 +514,10 @@ function gamepadAxes(inputSource) {
   return { trigger, grip, axes: Array.from(gp.axes), buttons };
 }
 
+let lastLoopTime = null;
 renderer.setAnimationLoop((timestamp, frame) => {
+  const dtS = lastLoopTime === null ? 0 : Math.min(0.1, (timestamp - lastLoopTime) / 1000);
+  lastLoopTime = timestamp;
   if (frame) {
     const refSpace = renderer.xr.getReferenceSpace();
     const session = renderer.xr.getSession();
@@ -350,9 +525,23 @@ renderer.setAnimationLoop((timestamp, frame) => {
     let headPayload = null;
     const viewerPose = frame.getViewerPose(refSpace);
     if (viewerPose) {
-      camera.matrixWorld.fromArray(viewerPose.views[0].transform.matrix);
-      camera.matrixWorld.decompose(tmpPos, tmpQuat, new THREE.Vector3());
-      headPayload = { pos: [tmpPos.x, tmpPos.y, tmpPos.z], quat: [tmpQuat.x, tmpQuat.y, tmpQuat.z, tmpQuat.w] };
+      // The viewer pose is the point between the eyes (views[0] is the left eye).
+      const p = viewerPose.transform.position;
+      const o = viewerPose.transform.orientation;
+      tmpPos.set(p.x, p.y, p.z);
+      tmpQuat.set(o.x, o.y, o.z, o.w);
+      headPayload = { pos: [p.x, p.y, p.z], quat: [o.x, o.y, o.z, o.w] };
+
+      if (viewerPose.views.length >= 2) {
+        const a = viewerPose.views[0].transform.position;
+        const b = viewerPose.views[1].transform.position;
+        const mm = 1000 * Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        if (mm > 30 && mm < 100) {
+          measuredIpdMm = mm;
+          if (ipdMm === null) setIpd(mm, false); // first run on this headset: start at its IPD
+        }
+      }
+      placeEyePlanes(tmpPos, tmpQuat);
 
       // Head-lock all three screens + status HUD to this frame's head pose.
       headLock(headScreen, HEAD_SCREEN_OFFSET, tmpPos, tmpQuat);
@@ -370,7 +559,10 @@ renderer.setAnimationLoop((timestamp, frame) => {
       if (!pose) continue;
       const payload = { ...poseFromXRPose(pose), ...gamepadAxes(inputSource) };
       if (inputSource.handedness === "left") leftPayload = payload;
-      if (inputSource.handedness === "right") rightPayload = payload;
+      if (inputSource.handedness === "right") {
+        rightPayload = payload;
+        updateIpdFromStick(inputSource.gamepad, dtS);
+      }
     }
 
     sendPose({ t: Date.now(), head: headPayload, left: leftPayload, right: rightPayload });

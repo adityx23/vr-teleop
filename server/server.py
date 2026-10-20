@@ -14,6 +14,8 @@ Run standalone:
     python server/server.py --video-only --port 8444 --camera-config cams.json
                                                    # camera machine (Orin), see docs/ORIN_VIDEO_SERVER.md
 GET /health returns JSON with connected clients and per-stream fps.
+GET /config.json returns {"video": <default video host:port or null>}; the page
+uses it when its URL has no ?video= (pass default_video= to run()).
 
 From the robot, use ../robot/whole_body_teleop.py, which calls run() with its
 own handler.
@@ -56,7 +58,12 @@ async def health(request):
     if streamer is not None:
         body["streams"] = streamer.stats
         body["frames_dropped"] = streamer.stats_dropped
+        body["stereo_info"] = streamer.stereo_info
     return web.json_response(body)
+
+
+async def page_config(request):
+    return web.json_response({"video": request.app["default_video"]})
 
 
 async def websocket_handler(request):
@@ -97,12 +104,14 @@ async def websocket_handler(request):
     return ws
 
 
-def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None):
+def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None,
+             default_video=None):
     """on_payload(payload_dict) -> status dict for the HUD (or None). Called on
     the event loop for every headset message, so it must not block. Pass
     on_payload=None for a video-only server."""
     app = web.Application()
     app["streamer"] = None
+    app["default_video"] = default_video
     app["counters"] = {"clients": 0}  # mutable: app state is frozen once started
     if cameras:
         from cameras import MultiCameraStreamer, load_config  # imports OpenCV; only when asked for
@@ -115,6 +124,7 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
     app.router.add_get("/", index)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/health", health)
+    app.router.add_get("/config.json", page_config)
     app.router.add_static("/static/", STATIC_DIR, name="static")
 
     async def on_cleanup(app):
@@ -126,7 +136,7 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
 
 
 def run(on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None,
-        host=HOST, port=PORT, cert_path=CERT_PATH, key_path=KEY_PATH):
+        default_video=None, host=HOST, port=PORT, cert_path=CERT_PATH, key_path=KEY_PATH):
     """Serve until Ctrl-C. Blocks."""
     if not Path(cert_path).exists() or not Path(key_path).exists():
         raise FileNotFoundError(f"Missing TLS cert/key ({cert_path}, {key_path})")
@@ -136,7 +146,8 @@ def run(on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_c
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = make_app(loop, on_payload, on_connect, on_disconnect, cameras=cameras, camera_config=camera_config)
+    app = make_app(loop, on_payload, on_connect, on_disconnect, cameras=cameras, camera_config=camera_config,
+                   default_video=default_video)
 
     log.info("Serving https://%s:%s  (cameras %s)", host, port, "on" if cameras else "off")
     web.run_app(app, host=host, port=port, ssl_context=ssl_context, loop=loop, print=None)

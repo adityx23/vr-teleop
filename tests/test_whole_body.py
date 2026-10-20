@@ -53,6 +53,7 @@ def state(left_ee=HOME_L, right_ee=HOME_R, lift=0.1, neck=(0.0, 0.0)):
 
 
 def make(**overrides):
+    overrides.setdefault("start_enabled", True)  # most tests exercise teleop while it's on
     cfg = WholeBodyConfig(pose_filter_alpha=1.0, **overrides)
     return WholeBodyTeleop(cfg)
 
@@ -236,15 +237,78 @@ def test_gripper_follows_trigger_only_while_clutched():
     assert out["arms"]["right"]["gripper"] == 0.8
 
 
-def test_home_only_when_not_clutched():
+def ax(left_buttons=(4,), right_buttons=(4,), **kw):
+    """Payload with A (right[4]) + X (left[4]) held: the on/off combo."""
+    return payload(left=ctrl([0, 1, 0], buttons=left_buttons), right=ctrl([0, 1.2, 0], buttons=right_buttons), **kw)
+
+
+def idle(**kw):
+    return payload(left=ctrl([0, 1, 0]), right=ctrl([0, 1.2, 0]), **kw)
+
+
+def test_starts_off_and_nothing_moves():
+    tele, clk = make(start_enabled=False), Clock()
+    out = run(tele, clk, payload(head_q=yaw_quat(30), right=ctrl([0, 1.2, 0], grip=1.0)), ticks=5)
+    assert not out["enabled"] and tele.status()["state"] == "OFF"
+    assert not out["arms"]["right"]["clutched"] and out["neck"] is None and out["lift_target"] is None
+
+
+def test_ax_tap_toggles_on_release():
+    tele, clk = make(start_enabled=False), Clock()
+    run(tele, clk, ax(), ticks=5)  # held 0.17 s
+    assert not tele.enabled  # nothing until release
+    out = run(tele, clk, idle())
+    assert out["enabled"] and tele.status()["state"] == "ON"
+    run(tele, clk, ax(), ticks=3)
+    out = run(tele, clk, idle())
+    assert not out["enabled"]
+
+
+def test_single_buttons_and_left_xy_do_nothing():
+    tele, clk = make(start_enabled=False), Clock()
+    for lb, rb in (((4,), ()), ((), (4,)), ((4, 5), ()), ((5,), (5,))):
+        run(tele, clk, ax(lb, rb), ticks=3)
+        run(tele, clk, idle())
+    assert not tele.enabled
+
+
+def test_ax_hold_homes_once_and_turns_off():
     tele, clk = make(), Clock()
-    out = run(tele, clk, payload(right=ctrl([0, 1.2, 0], grip=1.0, buttons=[5])))
-    assert out["home"] == []
-    run(tele, clk, payload(right=ctrl([0, 1.2, 0])))
-    out = run(tele, clk, payload(right=ctrl([0, 1.2, 0], buttons=[5])))
-    assert out["home"] == ["right"]
-    out = run(tele, clk, payload(right=ctrl([0, 1.2, 0], buttons=[5])))  # held: no repeat
-    assert out["home"] == []
+    run(tele, clk, payload(left=ctrl([0, 1, 0]), right=ctrl([0, 1.2, 0], grip=1.0)))
+    homes = 0
+    for _ in range(90):  # 3 s held
+        out = run(tele, clk, payload(left=ctrl([0, 1, 0], buttons=[4]), right=ctrl([0, 1.2, 0], grip=1.0, buttons=[4])))
+        homes += out["home_all"]
+    assert homes == 1 and out["home"] == []
+    assert not out["enabled"] and not out["arms"]["right"]["clutched"]
+    out = run(tele, clk, idle())  # release after a hold: no toggle
+    assert not out["enabled"]
+
+
+def test_enable_requires_fresh_grip():
+    tele, clk = make(start_enabled=False), Clock()
+    grip = lambda b=(): ctrl([0, 1.2, 0], grip=1.0, buttons=b)  # noqa: E731
+    run(tele, clk, payload(left=ctrl([0, 1, 0], buttons=[4]), right=grip([4])))
+    out = run(tele, clk, payload(left=ctrl([0, 1, 0]), right=grip()), ticks=3)
+    assert out["enabled"] and not out["arms"]["right"]["clutched"]  # grip was already held
+    run(tele, clk, idle())
+    out = run(tele, clk, payload(left=ctrl([0, 1, 0]), right=grip()))
+    assert out["arms"]["right"]["clutched"]
+
+
+def test_tracking_dropout_mid_combo_does_not_toggle():
+    tele, clk = make(start_enabled=False), Clock()
+    run(tele, clk, ax())
+    run(tele, clk, payload(left=None, right=ctrl([0, 1.2, 0], buttons=[4])), ticks=3)
+    assert not tele.enabled
+
+
+def test_disable_stops_base_and_holds_neck():
+    tele, clk = make(), Clock()
+    tele.base_mode = True
+    run(tele, clk, ax())
+    out = run(tele, clk, payload(left=ctrl([0, 1, 0], axes=(0, 0, 0, -1.0)), right=ctrl([0, 1.2, 0])))
+    assert not out["base_mode"] and out["base_velocity"] == [0.0, 0.0, 0.0] and out["neck"] is None
 
 
 # ---------------------------------------------------------------------- base
@@ -253,8 +317,8 @@ def test_base_toggle_and_sticks():
     sticks_l, sticks_r = (0, 0, -0.5, -1.0), (0, 0, 1.0, 0)
     out = run(tele, clk, payload(left=ctrl([0, 1, 0], axes=sticks_l), right=ctrl([0, 1, 0], axes=sticks_r)))
     assert not out["base_mode"] and out["base_velocity"] == [0.0, 0.0, 0.0]
-    both = lambda: payload(left=ctrl([0, 1, 0], buttons=[4], axes=sticks_l),  # noqa: E731
-                           right=ctrl([0, 1, 0], buttons=[4], axes=sticks_r))
+    both = lambda: payload(left=ctrl([0, 1, 0], buttons=[5], axes=sticks_l),  # noqa: E731  (B + Y)
+                           right=ctrl([0, 1, 0], buttons=[5], axes=sticks_r))
     out = run(tele, clk, both())
     assert out["base_mode"]
     vx, vy, wz = out["base_velocity"]
@@ -301,6 +365,15 @@ def test_neck_recenter_and_limits():
     assert out["neck"]["pan"] == 90.0  # clamped
     out = run(tele, clk, payload(head_q=yaw_quat(150), left=ctrl([0, 1, 0], buttons=[3])))
     assert abs(out["neck"]["pan"]) < 1e-6  # recentered
+
+
+def test_neck_offsets_and_signs():
+    tele, clk = make(neck_max_speed_dps=1e6, neck_pan_offset_deg=2.0, neck_tilt_offset_deg=-3.0,
+                     neck_pan_sign=-1.0), Clock()
+    out = run(tele, clk, payload(), ticks=2)  # tick 1 (dt = 0) holds the measured pose
+    assert abs(out["neck"]["pan"] - 2.0) < 1e-6 and abs(out["neck"]["tilt"] + 3.0) < 1e-6
+    out = run(tele, clk, payload(head_q=yaw_quat(30)))
+    assert abs(out["neck"]["pan"] - (2.0 - 30)) < 1e-6  # flipped pan sign
 
 
 def test_neck_speed_limit_starts_from_measured():

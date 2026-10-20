@@ -10,18 +10,19 @@ this file, this file wins for the Orin.
 ```
 Quest headset (WebXR page)
  ├─ wss://192.168.123.55:8443/ws    poses up, HUD down   -> Pi: control -> robot (CAN, neck, lift, base)
- └─ wss://192.168.123.116:8444/ws   video down           -> Orin (you): ZED + wrist cams
+ └─ wss://192.168.123.117:8444/ws   video down           -> Orin (you): ZED + wrist cams
 ```
 
 - **Pi** (`192.168.123.55`, Wi-Fi): runs `robot/whole_body_teleop.py` from the
   YOR repo. It serves the WebXR page, receives headset poses, and drives the
   robot. **It publishes no video and never will.** It is already working.
-- **Orin** (`192.168.123.116`): has the cameras, not the robot. Your job is to
+- **Orin** (`192.168.123.117`): has the cameras, not the robot. Your job is to
   run `server/server.py --video-only` here so the headset shows the camera
   feeds. **Do not send robot commands or handle poses from the Orin.** Pose
   messages sent to the video server are ignored on purpose.
-- **Headset**: opens `https://192.168.123.55:8443/?video=192.168.123.116:8444`.
-  The page's `?video=` parameter tells it where your server is.
+- **Headset**: opens `https://192.168.123.55:8443`. The Pi tells the page
+  where your server is (default `192.168.123.117:8444`, via `/config.json`);
+  `?video=<host:port>` in the URL overrides it, `?video=none` turns video off.
 
 ## Contract you must keep
 
@@ -30,14 +31,50 @@ of them, the Pi side has to change too, so don't, unless the user asks:
 
 - **Port** `8444`, HTTPS/WSS with a self-signed cert, WebSocket at `/ws`.
 - **Wire format**: every binary WebSocket message is `[1 byte stream id] + [JPEG bytes]`.
-- **Stream ids**: `0 = head` (ZED, left eye), `1 = gripper_left`, `2 = gripper_right`
-  (wrist cameras). They are defined in `server/cameras.py` `STREAM_IDS` and in
+- **Stream ids**: `0 = head` (ZED, left eye, mono fallback), `1 = gripper_left`,
+  `2 = gripper_right` (wrist cameras), `3 = head_stereo` (see "Stereo head view"). They are defined in `server/cameras.py` `STREAM_IDS` and in
   `static/main.js` `STREAMS`.
 - The client draws each JPEG into a 640x480 canvas (any size is scaled), so
   640x480 or smaller keeps bandwidth down.
 - Text messages from clients are ignored. Your server sends none.
 - `GET /health` returns JSON with the client count and per-stream `source`,
   `fps`, `frames`, `error`.
+
+## Stereo head view (added 2026-10-20)
+
+The headset now shows the ZED in stereo: left image to the left eye, right
+image to the right eye, at true scale. This adds to the contract above:
+
+- **Stream id 3, `head_stereo`**: one JPEG per frame with the **rectified**
+  left and right images **side by side** (`[left | right]`, total width =
+  2 x per-eye width). Both halves must come from the same `grab()`; never
+  pair frames from separate captures. pyzed: `retrieve_image(mat, sl.VIEW.SIDE_BY_SIDE)`.
+- **`stereo_info` text message**: sent to every client on connect, and again
+  if it changes:
+  `{"type": "stereo_info", "stream": 3, "width", "height", "fx", "fy", "cx", "cy", "baseline_m", "model"}`.
+  `width`/`height` are **per eye** in pixels as streamed, and fx/fy/cx/cy are
+  the rectified left-camera intrinsics **scaled to that size**, not the
+  native resolution. The headset sizes the view from these, so wrong values
+  make everything look too big or too small. Also exposed in `/health`.
+- `server/cameras.py` on the `pi` branch implements this
+  (`{"type": "zed", "view": "side_by_side"}` for the `head_stereo` stream;
+  see `camera_config.example.json`). If you already changed `cameras.py`
+  on the Orin, merge this in rather than replacing your version, and keep
+  your approach to camera ownership.
+- The ZED can only be opened once, so don't configure `head` and
+  `head_stereo` both as `zed` sources. Set `head` to `stub` (the headset
+  hides the mono screen while stereo frames arrive), or derive mono `head`
+  from the left half of the same capture if you want a fallback.
+- Suggested size: 960x540 per eye (1920x540 frame), 30 fps, JPEG quality ~75.
+  That's the biggest stream by far: watch `/health` fps and `frames_dropped`,
+  and drop to 672x376 per eye (ZED VGA) if the Wi-Fi can't keep up.
+- The robot's ZED is a **ZED 2 / 2i (120 mm baseline)**, about twice human
+  eye spacing, so operators will see depth exaggerated. That's expected; the
+  headset's IPD adjustment only moves the comfortable fusion point.
+
+Check: `python tools/video_probe.py localhost:8444` prints the `stereo_info`
+message and a `head_stereo` fps line; `--save-dir` saves a frame whose two
+halves should look nearly identical except for a small horizontal shift.
 
 ## Hardware state (as of 2026-10-20)
 
@@ -108,7 +145,7 @@ the Pi's base navigation. Never stop it without asking.
    has been mixed up before.
 4. **Cert** for the Orin's IP:
    ```bash
-   python server/gen_cert.py 192.168.123.116
+   python server/gen_cert.py 192.168.123.117
    ```
 5. **Run:**
    ```bash
@@ -124,14 +161,14 @@ the Pi's base navigation. Never stop it without asking.
 2. On the Orin: `python tools/video_probe.py localhost:8444 --save-dir /tmp/frames`.
    Look at the saved JPEGs: right camera in the right slot, image not
    upside-down, sensible exposure.
-3. From the Pi (or another LAN machine): `python tools/video_probe.py 192.168.123.116:8444`.
+3. From the Pi (or another LAN machine): `python tools/video_probe.py 192.168.123.117:8444`.
    This proves it's reachable over the network. Compare fps with step 2.
-4. On the headset, **first visit `https://192.168.123.116:8444/` directly** and
+4. On the headset, **first visit `https://192.168.123.117:8444/` directly** and
    accept the cert warning. It should then say "vr-teleop video server OK".
    Use
    `https://`: plain `http://` gives `ERR_EMPTY_RESPONSE`. Without this step
    the video socket fails silently.
-5. Then open `https://192.168.123.55:8443/?video=192.168.123.116:8444`. The
+5. Then open `https://192.168.123.55:8443/?video=192.168.123.117:8444`. The
    status line on the page says `control: open | video: NN fps`. In VR, the
    HUD shows `NO VIDEO` while frames are missing.
 

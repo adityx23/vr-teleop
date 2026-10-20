@@ -97,3 +97,11 @@ The robot Pi serves the page and runs control (no video); the Orin runs
 the video socket from `?video=<host:port>`. Orin setup and the camera
 ownership constraint: `docs/ORIN_VIDEO_SERVER.md`. Check a video server with
 `tools/video_probe.py <host:port>` or `GET /health`.
+
+## Stereo ZED view
+Stream 3 (`head_stereo`) carries rectified left|right side by side; the video
+server also sends a `stereo_info` JSON message with per-eye intrinsics.
+`static/main.js` shows each half to one eye only (three.js XR layers 1/2),
+true scale from fx/fy/cx/cy, eye planes `ipd` apart. IPD: right stick up/down
+(not in base mode), right stick click resets to the headset's measured IPD,
+stored in localStorage, `?ipd=<mm>` overrides.
