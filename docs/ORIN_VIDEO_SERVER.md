@@ -78,12 +78,27 @@ halves should look nearly identical except for a small horizontal shift.
 
 ## Hardware state (as of 2026-10-20)
 
-- Head camera: ZED (SDK 4.2 era), on the 2-DOF neck, which rides on the lift.
-- Wrist cameras: one per arm. **The left gripper is removed.** Ask the user
+- Head camera: ZED 2i (S/N 30496273), ZED SDK 5.2.3 on the Orin, on the 2-DOF
+  neck, which rides on the lift.
+- Wrist cameras: one per arm, **not plugged into the Orin yet** (only the ZED
+  shows up in `/dev/v4l`), so both gripper streams are stubs in
+  `camera_config.orin.json`. **The left gripper is removed.** Ask the user
   whether a left wrist camera is still mounted; if not, leave `gripper_left`
   as a stub.
 - There is also a fisheye camera. It is **not** part of the headset streams
   yet; adding a 4th stream means changing `main.js` too, so leave it out.
+
+## Quick start (Orin, already set up)
+
+```bash
+cd ~/yor_ws/vr-teleop && ./start_video.sh   # Ctrl-C to stop
+```
+Uses `camera_config.orin.json` (`head` stub, `head_stereo` ZED side by side
+960x540 per eye, 30 fps, ~82 KB/frame; grippers stub) and the `vr_teleop`
+micromamba env (Python 3.10 + requirements + pyzed 5.2, `PYTHONNOUSERSITE=1`
+because `~/.local` has a NumPy 2 that breaks the system OpenCV). Open headset
+pages pick the stream up within ~2 s. Approach 1 below: the video server
+opens the ZED itself, so stop anything else holding it first.
 
 ## Most important constraint: the ZED can only be opened by one process
 

@@ -1,145 +1,112 @@
 # VR Teleop
 
-VR headset teleop over the LAN: multi-camera streaming into the headset,
-plus head/controller pose capture driving a (currently stubbed) arm/base/
-head-camera control pipeline.
+WebXR teleop for the YOR robot from a Quest headset over the LAN: the robot
+Pi runs control, the Jetson Orin streams the cameras (ZED stereo + wrist
+cams) into the headset.
 
-## Architecture
-- `server/server.py` — HTTPS + WebSocket server on this PC.
-- `server/cameras.py` — `MultiCameraStreamer`: broadcasts 3 camera feeds
-  multiplexed over one WebSocket (`[1 stream-id byte] + [JPEG bytes]`).
-  Only the **head** stream is real hardware right now (this PC's webcam,
-  standing in for the robot's ZED camera); **gripper_left**/**gripper_right**
-  are placeholder "NO SIGNAL" frames until those cameras are wired up.
-- `static/` — WebXR (Three.js) page. Renders all 3 streams as head-locked
-  screens (one large center view for the head/ZED cam, two small insets in
-  the lower corners for the gripper cams) and both controllers. Every XR
-  frame it sends head pose + left/right controller pose (position,
-  quaternion, trigger/grip values, thumbstick axes, button states) back to
-  the server.
-- `server/teleop.py` — `TeleopController`: the enable state machine +
-  pose/button -> command mapping described below. `_dispatch()` is the one
-  place that currently just logs computed commands — replace it with real
-  robot calls once that interface exists.
-- `server/quat.py` — small quaternion helpers for frame-relative poses.
+## System (two machines + headset)
 
-## Control scheme (robot side, as specified)
-Button layout follows the WebXR "xr-standard" mapping Quest Touch
-controllers use: `buttons[4]` is the primary face button — **A** on the
-right controller, **X** on the left. Thumbsticks are `axes[2]`/`axes[3]`.
-
-**Enable state machine** — `IDLE` / `ARMS` / `BASE`, mutually exclusive:
-- From `IDLE`: **A** alone enables the right arm, **X** alone enables the
-  left arm (state -> `ARMS`). **A+X together** enables the base
-  (state -> `BASE`).
-- From `ARMS`: pressing the *other* side's button alone brings that arm up
-  too (so you can enable one arm, then the other). **A+X together**
-  disables both arms, commands them to their home pose, and returns to
-  `IDLE`.
-- From `BASE`: **A+X together** disables the base and returns to `IDLE`.
-
-"Together" is detected via a 150ms window (`COMBO_WINDOW_MS` in
-`teleop.py`), not an exact-same-frame requirement, since two physical button
-presses are never perfectly simultaneous. A single-button press is held
-for that same window before being committed, in case the other button
-joins it as a combo.
-
-**Arm control (while enabled):**
-- Controller pose -> end-effector target: each controller's pose is first
-  expressed *relative to the head pose* (so the mapping holds regardless of
-  which way you're facing/standing), then tracked as a **delta** from the
-  pose captured at the moment that arm was enabled. That delta is applied
-  on top of the arm's home pose. This is a "clutch" style mapping — you can
-  disable/re-enable an arm to reset where your controller needs to be
-  without the arm jumping.
-- Trigger value (0–1) -> gripper close amount for that arm.
-
-**Base control (while enabled):** left thumbstick -> linear x/y velocity,
-right thumbstick's x-axis -> yaw rate. Scaled by `MAX_BASE_LINEAR_MPS` /
-`MAX_BASE_YAW_RPS` in `teleop.py` — both placeholders, tune for the real
-base.
-
-**Head camera (2-DOF active perception / ZED neck):** pan/tilt mirrors the
-headset's yaw/pitch 1:1, continuously, independent of arm/base enable
-state — so you can always look around. Zeroed ("straight ahead") to
-whatever orientation the headset reports on the first frame of the
-session; clamped to `NECK_YAW_LIMIT_DEG` / `NECK_PITCH_LIMIT_DEG`.
-
-All of the above is implemented as pure logic against a single shared
-`TeleopController` instance and verified with scripted button/pose
-sequences (no robot attached) — see the state transitions, EE delta
-tracking, neck mirroring, and base mapping all producing correct output in
-isolation. **No real camera (ZED/gripper) or robot arm/base interface is
-wired up yet** — that's the explicit next step once that hardware/SDK
-access exists.
-
-## One-time setup
-
-```powershell
-cd C:\Users\Aditya\vr_teleop
-python -m pip install -r requirements.txt
+```
+Quest headset (WebXR page, served by the Pi)
+ ├─ wss://192.168.123.55:8443/ws    poses up, HUD down  -> Pi: whole-body control -> robot
+ └─ wss://192.168.123.117:8444/ws   video down          -> Orin: ZED + wrist cams
 ```
 
-Find this PC's LAN IP (Wi-Fi adapter) — already known to be `192.168.123.156`
-on this network. Generate a cert that's valid for that IP (WebXR requires
-HTTPS when not on localhost):
+- **Pi** (`192.168.123.55`): runs `robot/whole_body_teleop.py` from the YOR
+  repo, which calls `server/server.py`'s `run()` with `server/whole_body.py`
+  as the pose handler. Serves the page, drives arms/lift/neck/base. No video.
+  Tells the page where the video server is via `GET /config.json`.
+- **Orin** (`192.168.123.117`): `./start_video.sh` runs
+  `server/server.py --video-only --port 8444` with `camera_config.orin.json`.
+  Ignores poses, sends no commands. Details, contract and camera-ownership
+  rules: `docs/ORIN_VIDEO_SERVER.md`.
+- **Headset** (`192.168.123.227`): opens `https://192.168.123.55:8443`.
+  `?video=<host:port>` overrides the video server, `?video=none` turns video
+  off, `?ipd=<mm>` sets the stereo IPD.
 
-```powershell
-python server\gen_cert.py 192.168.123.156
-```
+## Code map
+- `server/server.py` — HTTPS + WebSocket server (`run()`), `/health`,
+  `/config.json`, `--video-only` mode for the Orin.
+- `server/cameras.py` — `MultiCameraStreamer`: camera sources from a JSON
+  config (`stub` / `opencv` / `zed`), multiplexed over one WebSocket as
+  `[1 stream-id byte] + [JPEG bytes]`. Streams: `0 head` (mono), `1
+  gripper_left`, `2 gripper_right`, `3 head_stereo` (rectified left|right
+  side by side, plus a `stereo_info` JSON calibration message).
+- `server/whole_body.py` — `WholeBodyTeleop`: clutched relative-delta
+  whole-body teleop (arms, lift retargeting, neck, base). Pure logic; tests
+  in `tests/test_whole_body.py`.
+- `server/lift_retarget.py`, `server/quat.py` — helpers.
+- `server/teleop.py` — older `TeleopController` (IDLE/ARMS/BASE scheme),
+  only used by the standalone dev-PC mode below.
+- `static/main.js` — WebXR (three.js) page: sends head + controller poses
+  every XR frame, draws the HUD, the gripper insets, and the ZED view. With
+  stereo frames it shows each half to one eye at true scale (from
+  `stereo_info`); otherwise the mono head screen.
+- `tools/video_probe.py` — connect like the headset and report fps per stream.
 
-Re-run `gen_cert.py` if this PC's IP changes (different network, DHCP
-renewal, etc.) — pass whatever the new IP is.
+## Controls (Quest Touch, from `server/whole_body.py`)
+| input | action |
+|---|---|
+| A + X, tap | toggle teleop on/off (starts **off**; while off nothing moves) |
+| A + X, hold 1.5 s | home both arms + neck, teleop off |
+| grip (hold) | clutch that arm: hand motion moves it; release and it holds |
+| index trigger | gripper close amount while clutched |
+| B + Y | toggle base mode |
+| left stick / right stick x | base vx, vy / yaw rate (base mode) |
+| left stick click | recenter the neck's "straight ahead" |
+| head | neck pan/tilt, always on |
+| head height + arms | lift (only while an arm is clutched) |
+| right stick up/down | stereo IPD (not in base mode); right stick click resets to the headset's measured IPD |
+
+Constants (scales, speed limits, neck signs/offsets, lift) are in
+`WholeBodyConfig`; several are marked VERIFY on hardware.
 
 ## Running
 
-```powershell
-python server\server.py
+**Orin** (cameras; ZED must not be open in another process, e.g.
+`collect.py` / `deploy_observer.py` / the recorder):
+```bash
+cd ~/yor_ws/vr-teleop && ./start_video.sh
 ```
+Uses the `vr_teleop` micromamba env (system Python on the Orin has a broken
+OpenCV/NumPy combo). Check with `curl -sk https://localhost:8444/health`.
 
-You should see: `Serving https://0.0.0.0:8443 ...`
+**Pi**: run `robot/whole_body_teleop.py` (YOR repo).
 
-### Windows Firewall
-First run will likely trigger a Windows Defender Firewall prompt for
-`python.exe` — allow it. If you don't get a prompt and the headset can't
-connect, add a rule manually:
+**Headset**, first time per cert: visit `https://192.168.123.117:8444/` and
+`https://192.168.123.55:8443/` and accept the self-signed cert warnings. Then
+open `https://192.168.123.55:8443` and click **Enter VR**. The status line
+shows `control: open | video: NN fps | IPD ...`; the page reconnects by
+itself if either server restarts.
 
-```powershell
-New-NetFirewallRule -DisplayName "VR Teleop" -Direction Inbound -Protocol TCP -LocalPort 8443 -Action Allow
-```
+Certs: `python server/gen_cert.py <machine-ip>` on each machine; re-run if
+its IP changes. Open the port in the firewall if needed (`sudo ufw allow
+8444/tcp` on the Orin, 8443 on the Pi).
 
 ### Network note
-WebXR and the WebSocket both require the headset to actually reach this PC
-on the LAN. If connections work from this machine but not from the
-headset, check for client/AP isolation on the router/hotspot — some
-networks (especially ones named like dedicated "teleop" networks) block
-device-to-device traffic by default even on the same subnet.
+If connections work locally but not from the headset, check for client/AP
+isolation on the router — some networks block device-to-device traffic on
+the same subnet.
 
-## On the headset (192.168.123.227)
-1. Make sure the headset is on the same Wi-Fi network as this PC.
-2. Open the browser (e.g. Oculus/Meta Browser) and go to:
-   `https://192.168.123.156:8443`
-3. Accept the self-signed certificate warning (Advanced -> Proceed /
-   "visit this website").
-4. Click **Enter VR**. You'll see the head-camera feed as a big head-locked
-   screen and two small gripper-camera insets (currently "NO SIGNAL" stubs)
-   in the lower corners, plus your controllers as colored cones
-   (green = left, red = right). All three screens follow your head like a
-   HUD.
-5. Watch this PC's console: it logs the current state
-   (`IDLE`/`ARMS`/`BASE`), which arms are enabled, the computed neck
-   pan/tilt, arm EE targets, and base velocity a couple of times a second —
-   try the button combos above and confirm the state machine responds as
-   expected.
+## Dev PC (legacy, single machine, no robot)
+`python server/server.py --cameras` serves the page, streams a local webcam
+as `head` (default config), and runs the old `TeleopController`, which only
+logs commands. On Windows:
+```powershell
+python -m pip install -r requirements.txt
+python server\gen_cert.py <this-pc-ip>
+python server\server.py --cameras
+```
+Allow `python.exe` through Windows Defender Firewall (or
+`New-NetFirewallRule -DisplayName "VR Teleop" -Direction Inbound -Protocol TCP -LocalPort 8443 -Action Allow`).
 
 ## Known limitations / next steps
-- Camera streams are JPEG-over-WebSocket (head cam ~20fps, gripper stubs
-  ~2fps, 640x480) — fine for validating the pipeline, but swap for a proper
-  codec (WebRTC/H.264) once latency matters for real teleop.
-- Gripper cameras are placeholder frames; head cam is this PC's webcam
-  standing in for the ZED. Swap `cameras.py`'s capture threads for the real
-  ZED SDK + gripper camera sources when available.
-- `teleop.py`'s `_dispatch()` only logs — no real arm IK solver, no base
-  driver, no neck servo connection yet. The EE *targets* it computes are
-  ready to feed into whatever IK solver the robot uses.
-- No auth on the server — fine on a trusted LAN, not for anything else.
+- Video is JPEG over WebSocket. The stereo stream is the big one (960x540
+  per eye, ~82 KB/frame, ~20 Mbit/s at 30 fps); watch `/health`
+  `frames_dropped` and drop to VGA (672x376 per eye) if Wi-Fi can't keep up.
+  WebRTC/H.264 on the Orin's hardware encoder is the eventual fix.
+- Wrist cameras are stubs until connected (left gripper is removed). The
+  fisheye isn't streamed (would need a 4th screen in `main.js`).
+- The ZED's 120 mm baseline is ~2x human eye spacing, so depth looks
+  exaggerated.
+- No auth on either server — fine on the robot LAN, nothing else.

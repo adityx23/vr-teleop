@@ -1,0 +1,6 @@
+{
+  "head": {"type": "stub"},
+  "head_stereo": {"type": "zed", "view": "side_by_side", "resolution": "HD720", "width": 960, "height": 540, "fps": 30, "jpeg_quality": 75},
+  "gripper_left": {"type": "stub"},
+  "gripper_right": {"type": "stub"}
+}

@@ -31,7 +31,7 @@ import logging
 import ssl
 from pathlib import Path
 
-from aiohttp import web, WSMsgType
+from aiohttp import web, WSCloseCode, WSMsgType
 
 log = logging.getLogger("vr_teleop")
 
@@ -77,6 +77,7 @@ async def websocket_handler(request):
         streamer.add_client(ws)
     peer = request.remote
     request.app["counters"]["clients"] += 1
+    request.app["websockets"].add(ws)
     log.info("Client connected: %s", peer)
     if on_connect:
         on_connect(peer)
@@ -98,6 +99,7 @@ async def websocket_handler(request):
         if streamer is not None:
             streamer.remove_client(ws)
         request.app["counters"]["clients"] -= 1
+        request.app["websockets"].discard(ws)
         log.info("Client disconnected: %s", peer)
         if on_disconnect:
             on_disconnect(peer)
@@ -113,6 +115,7 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
     app["streamer"] = None
     app["default_video"] = default_video
     app["counters"] = {"clients": 0}  # mutable: app state is frozen once started
+    app["websockets"] = set()
     if cameras:
         from cameras import MultiCameraStreamer, load_config  # imports OpenCV; only when asked for
 
@@ -131,6 +134,14 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
         if app["streamer"] is not None:
             app["streamer"].stop()
 
+    async def on_shutdown(app):
+        # Close open sockets so Ctrl-C exits right away instead of waiting out
+        # aiohttp's 60 s shutdown timeout while a headset is connected. The page
+        # reconnects on its own when the server comes back.
+        for ws in list(app["websockets"]):
+            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutdown")
+
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     return app
 

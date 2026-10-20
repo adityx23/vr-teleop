@@ -96,7 +96,8 @@ The robot Pi serves the page and runs control (no video); the Orin runs
 `server/server.py --video-only --port 8444` for camera feeds. The page opens
 the video socket from `?video=<host:port>`. Orin setup and the camera
 ownership constraint: `docs/ORIN_VIDEO_SERVER.md`. Check a video server with
-`tools/video_probe.py <host:port>` or `GET /health`.
+`tools/video_probe.py <host:port>` or `GET /health`. On the Orin,
+`./start_video.sh` starts it with `camera_config.orin.json`.
 
 ## Stereo ZED view
 Stream 3 (`head_stereo`) carries rectified left|right side by side; the video
