@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>VR Teleop</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0b0d10; color: #e8eaed; font-family: system-ui, sans-serif; }
+    #overlay { position: fixed; top: 0; left: 0; right: 0; padding: 12px 16px; z-index: 10; font-size: 14px; }
+    #status { opacity: 0.85; }
+    #enter-vr { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 10;
+                padding: 14px 28px; font-size: 16px; border-radius: 8px; border: 1px solid #4a90e2;
+                background: #1a73e8; color: white; }
+    canvas { display: block; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">
+    <div id="status">connecting...</div>
+  </div>
+  <script type="module" src="/static/main.js"></script>
+</body>
+</html>
