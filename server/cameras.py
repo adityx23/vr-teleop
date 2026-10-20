@@ -1,77 +1,163 @@
 """
-Multi-stream camera broadcast: head camera (stand-in for the robot's ZED
-camera) + left/right gripper cameras. Only the head stream is backed by
-real hardware right now (this PC's webcam, index 0) -- the gripper streams
-are placeholder frames until those cameras are wired up, so the rest of the
-pipeline (multiplexed transport, client-side demux/render) can be built and
-tested end to end today.
+Multi-stream camera broadcast to the headset. Runs on the camera machine (the
+Orin) via `server.py --video-only`; the robot Pi publishes no video.
 
 Wire protocol over the WebSocket's binary messages: each message is
   [1 byte stream id] + [JPEG bytes]
 so a single connection carries all streams; the client demuxes by that
-leading byte (see static/main.js).
+leading byte (see static/main.js -- STREAMS there must match STREAM_IDS here).
+
+Each stream is fed by a source picked in a JSON config (see
+camera_config.example.json and docs/ORIN_VIDEO_SERVER.md):
+  {"type": "stub"}                                      placeholder "NO SIGNAL" frames
+  {"type": "opencv", "device": "/dev/video0" | 0}       V4L2 webcam / USB camera
+  {"type": "zed", "serial": null, "view": "left"}       ZED via pyzed (opens the camera itself)
+Common options: "width", "height", "fps", "jpeg_quality".
+A source that fails to open falls back to stub frames, labelled with the reason.
 """
 import asyncio
+import json
 import logging
+import sys
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-from aiohttp import web
 
 log = logging.getLogger("vr_teleop.cameras")
 
 STREAM_IDS = {"head": 0, "gripper_left": 1, "gripper_right": 2}
 
-HEAD_CAMERA_INDEX = 0
-CAPTURE_WIDTH = 640
-CAPTURE_HEIGHT = 480
-HEAD_TARGET_FPS = 20
-GRIPPER_STUB_FPS = 2  # placeholder frames are static, no need to push them fast
-JPEG_QUALITY = 70
+DEFAULTS = {"width": 640, "height": 480, "fps": 20, "jpeg_quality": 70}
+STUB_FPS = 2  # placeholder frames are static, no need to push them fast
+
+# Used when no config file is given: head = first V4L2/DirectShow camera, grippers stubbed.
+DEFAULT_CONFIG = {
+    "head": {"type": "opencv", "device": 0},
+    "gripper_left": {"type": "stub"},
+    "gripper_right": {"type": "stub"},
+}
 
 
-def _encode(frame) -> bytes:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+def load_config(path=None):
+    if path is None:
+        return dict(DEFAULT_CONFIG)
+    cfg = json.loads(Path(path).read_text())
+    unknown = set(cfg) - set(STREAM_IDS)
+    if unknown:
+        raise ValueError(f"unknown stream(s) {sorted(unknown)}; valid: {sorted(STREAM_IDS)}")
+    return {name: cfg.get(name, {"type": "stub"}) for name in STREAM_IDS}
+
+
+def _encode(frame, quality) -> bytes:
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
     return buf.tobytes() if ok else b""
 
 
-def _make_stub_frame(label: str):
-    frame = np.full((CAPTURE_HEIGHT, CAPTURE_WIDTH, 3), (30, 30, 30), dtype=np.uint8)
-    cv2.putText(
-        frame, "NO SIGNAL", (CAPTURE_WIDTH // 2 - 140, CAPTURE_HEIGHT // 2 - 10),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (60, 60, 220), 2, cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame, label, (CAPTURE_WIDTH // 2 - 110, CAPTURE_HEIGHT // 2 + 30),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2, cv2.LINE_AA,
-    )
+def _make_stub_frame(label: str, width: int, height: int):
+    frame = np.full((height, width, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(frame, "NO SIGNAL", (width // 2 - 140, height // 2 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (60, 60, 220), 2, cv2.LINE_AA)
+    cv2.putText(frame, label[:40], (20, height // 2 + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
     return frame
 
 
+# ------------------------------------------------------------------ sources
+class OpenCVSource:
+    def __init__(self, opts):
+        device = opts.get("device", 0)
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+        self.cap = cv2.VideoCapture(device, backend)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, opts["width"])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, opts["height"])
+        if "fourcc" in opts:  # e.g. "MJPG" for USB cams that only do high fps compressed
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*opts["fourcc"]))
+        if not self.cap.isOpened():
+            self.cap.release()
+            raise RuntimeError(f"could not open {device}")
+        self.desc = f"opencv:{device}"
+
+    def read(self):
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def close(self):
+        self.cap.release()
+
+
+class ZedSource:
+    """Opens the ZED itself. Only one process can open a ZED: if another
+    process (e.g. the episode recorder) already owns it, this fails and the
+    stream falls back to stub -- see docs/ORIN_VIDEO_SERVER.md."""
+
+    def __init__(self, opts):
+        import pyzed.sl as sl
+
+        self.sl = sl
+        init = sl.InitParameters()
+        init.camera_resolution = getattr(sl.RESOLUTION, opts.get("resolution", "HD720"))
+        init.camera_fps = int(opts["fps"])
+        init.depth_mode = sl.DEPTH_MODE.NONE
+        if opts.get("serial"):
+            init.set_from_serial_number(int(opts["serial"]))
+        self.cam = sl.Camera()
+        err = self.cam.open(init)
+        if err != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"ZED open failed: {err}")
+        self.view = sl.VIEW.RIGHT if opts.get("view") == "right" else sl.VIEW.LEFT
+        self.mat = sl.Mat()
+        self.size = (int(opts["width"]), int(opts["height"]))
+        self.desc = f"zed:{opts.get('serial') or 'default'}:{opts.get('view', 'left')}"
+
+    def read(self):
+        if self.cam.grab() != self.sl.ERROR_CODE.SUCCESS:
+            return None
+        self.cam.retrieve_image(self.mat, self.view)
+        frame = cv2.cvtColor(self.mat.get_data(), cv2.COLOR_BGRA2BGR)
+        return cv2.resize(frame, self.size)
+
+    def close(self):
+        self.cam.close()
+
+
+SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource}
+
+
+# ----------------------------------------------------------------- streamer
 class MultiCameraStreamer:
     """One background thread per stream; each broadcasts
     [stream_id_byte + jpeg] to every connected client."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop: asyncio.AbstractEventLoop, config=None):
         self._loop = loop
-        self._clients: set[web.WebSocketResponse] = set()
+        self._clients = set()
         self._clients_lock = threading.Lock()
         self._stop = threading.Event()
+        self.config = config or dict(DEFAULT_CONFIG)
+        self.stats = {name: {"source": None, "frames": 0, "fps": 0.0, "error": None} for name in STREAM_IDS}
+        self.stats_dropped = 0
+        self._pending = {}  # (id(ws), stream_id) -> future of the in-flight send
         self._threads = [
-            threading.Thread(target=self._run_head, daemon=True),
-            threading.Thread(target=self._run_stub, args=("gripper_left", "left gripper (stub)"), daemon=True),
-            threading.Thread(target=self._run_stub, args=("gripper_right", "right gripper (stub)"), daemon=True),
+            threading.Thread(target=self._run, args=(name, {**DEFAULTS, **self.config.get(name, {})}), daemon=True)
+            for name in STREAM_IDS
         ]
 
-    def add_client(self, ws: web.WebSocketResponse):
+    def add_client(self, ws):
         with self._clients_lock:
             self._clients.add(ws)
 
-    def remove_client(self, ws: web.WebSocketResponse):
+    def remove_client(self, ws):
         with self._clients_lock:
             self._clients.discard(ws)
+            for key in [k for k in self._pending if k[0] == id(ws)]:
+                del self._pending[key]
+
+    def client_count(self):
+        with self._clients_lock:
+            return len(self._clients)
 
     def start(self):
         for t in self._threads:
@@ -83,56 +169,71 @@ class MultiCameraStreamer:
             t.join(timeout=2)
 
     # ------------------------------------------------------------- workers
-    def _run_head(self):
-        stream_id = STREAM_IDS["head"]
-        cap = cv2.VideoCapture(HEAD_CAMERA_INDEX, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
-        if not cap.isOpened():
-            log.error("Could not open head camera index %s -- falling back to stub frames", HEAD_CAMERA_INDEX)
-            cap.release()
-            self._run_stub("head", "head/ZED camera (stub, open failed)")
+    def _run(self, name, opts):
+        kind = opts.get("type", "stub")
+        if kind == "stub":
+            self._run_stub(name, opts, f"{name} (stub)")
+            return
+        try:
+            source = SOURCE_TYPES[kind](opts)
+        except Exception as e:  # noqa: BLE001 -- any failure -> visible stub, keep other streams alive
+            log.error("%s: %s source failed (%s) -- streaming stub frames", name, kind, e)
+            self.stats[name]["error"] = str(e)
+            self._run_stub(name, opts, f"{name}: {kind} failed")
             return
 
-        period = 1.0 / HEAD_TARGET_FPS
-        log.info("Head camera %s opened, streaming at target %s fps", HEAD_CAMERA_INDEX, HEAD_TARGET_FPS)
+        self.stats[name]["source"] = source.desc
+        log.info("%s: %s opened, target %s fps", name, source.desc, opts["fps"])
+        period = 1.0 / opts["fps"]
+        window_start, window_frames = time.time(), 0
         try:
             while not self._stop.is_set():
                 t0 = time.time()
-                ok, frame = cap.read()
-                if not ok:
+                frame = source.read()
+                if frame is None:
+                    time.sleep(0.01)
                     continue
-                data = _encode(frame)
+                data = _encode(frame, opts["jpeg_quality"])
                 if data:
-                    self._broadcast(stream_id, data)
+                    self._broadcast(STREAM_IDS[name], data)
+                    self.stats[name]["frames"] += 1
+                    window_frames += 1
+                if t0 - window_start >= 1.0:
+                    self.stats[name]["fps"] = round(window_frames / (t0 - window_start), 1)
+                    window_start, window_frames = t0, 0
                 dt = time.time() - t0
                 if dt < period:
                     time.sleep(period - dt)
         finally:
-            cap.release()
+            source.close()
 
-    def _run_stub(self, stream_name: str, label: str):
-        stream_id = STREAM_IDS[stream_name]
-        frame = _make_stub_frame(label)
-        data = _encode(frame)
-        period = 1.0 / GRIPPER_STUB_FPS
-        log.info("Streaming stub frames for %s", stream_name)
+    def _run_stub(self, name, opts, label):
+        self.stats[name]["source"] = self.stats[name]["source"] or "stub"
+        data = _encode(_make_stub_frame(label, opts["width"], opts["height"]), opts["jpeg_quality"])
         while not self._stop.is_set():
             if data:
-                self._broadcast(stream_id, data)
-            time.sleep(period)
+                self._broadcast(STREAM_IDS[name], data)
+                self.stats[name]["frames"] += 1
+            self.stats[name]["fps"] = float(STUB_FPS)
+            time.sleep(1.0 / STUB_FPS)
 
     def _broadcast(self, stream_id: int, jpeg_bytes: bytes):
         payload = bytes([stream_id]) + jpeg_bytes
         with self._clients_lock:
-            clients = list(self._clients)
-        for ws in clients:
-            asyncio.run_coroutine_threadsafe(self._safe_send(ws, payload), self._loop)
+            for ws in self._clients:
+                # Drop this frame for a client whose previous frame on this stream is
+                # still sending, so a slow link shows fewer frames instead of growing lag.
+                key = (id(ws), stream_id)
+                pending = self._pending.get(key)
+                if pending is not None and not pending.done():
+                    self.stats_dropped += 1
+                    continue
+                self._pending[key] = asyncio.run_coroutine_threadsafe(self._safe_send(ws, payload), self._loop)
 
     @staticmethod
-    async def _safe_send(ws: web.WebSocketResponse, data: bytes):
+    async def _safe_send(ws, data: bytes):
         try:
             if not ws.closed:
                 await ws.send_bytes(data)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass

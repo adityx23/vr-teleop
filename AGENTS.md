@@ -80,3 +80,20 @@ machine's webcam, standing in for the robot's ZED camera).
 Swap the capture threads for the real sources; the multiplexed WebSocket
 wire format (`[1 stream-id byte] + [JPEG bytes]`) and the client-side demux
 in `static/main.js` don't need to change.
+
+## Whole-body clutch teleop (YOR)
+`server/whole_body.py` (`WholeBodyTeleop`) is the clutched relative-delta
+controller for YOR: hold grip to drive an arm, A+X toggles base mode, head
+drives the neck, and `server/lift_retarget.py` sets the lift height from head
+height + clutched arm targets. It is pure logic (`update(payload, robot_state,
+now_s) -> commands`); the robot bridge and `../robot/whole_body_teleop.py`
+launcher come next. Constants marked VERIFY (XR->robot axes, neck signs, lift
+travel/band/speed) are unvalidated on hardware.
+Tests: `python tests/test_whole_body.py` (also pytest-compatible).
+
+## Two-machine setup (current)
+The robot Pi serves the page and runs control (no video); the Orin runs
+`server/server.py --video-only --port 8444` for camera feeds. The page opens
+the video socket from `?video=<host:port>`. Orin setup and the camera
+ownership constraint: `docs/ORIN_VIDEO_SERVER.md`. Check a video server with
+`tools/video_probe.py <host:port>` or `GET /health`.

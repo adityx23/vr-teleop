@@ -1,0 +1,5 @@
+{
+  "head": {"type": "zed", "view": "left", "resolution": "HD720", "width": 640, "height": 480, "fps": 30},
+  "gripper_left": {"type": "stub"},
+  "gripper_right": {"type": "opencv", "device": "/dev/v4l/by-id/REPLACE-right-wrist-cam-video-index0", "fourcc": "MJPG", "fps": 30}
+}

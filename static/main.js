@@ -3,24 +3,67 @@ import { VRButton } from "three/addons/webxr/VRButton.js";
 
 const statusEl = document.getElementById("status");
 
-// ---------- WebSocket: camera frames in, pose data out ----------
+// ---------- WebSockets ----------
+// Control socket: always the server that served this page (the robot Pi).
+//   pose data out every XR frame, teleop_state JSON (HUD) in.
+// Video socket: optional, a separate camera server (the Orin), given as
+//   ?video=<host:port>, e.g. https://192.168.123.55:8443/?video=192.168.123.116:8444
+//   Binary frames in only. Its TLS cert must have been accepted once by
+//   visiting https://<host:port>/ directly, or the socket fails silently.
+// Either socket also accepts binary frames, so a single server that does both
+// (server.py --cameras on a dev PC) still works without ?video=.
 const wsProto = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
-ws.binaryType = "arraybuffer";
+const videoHost = new URLSearchParams(location.search).get("video");
+
+const links = {
+  control: { url: `${wsProto}://${location.host}/ws`, ws: null, state: "connecting" },
+  video: videoHost ? { url: `${wsProto}://${videoHost}/ws`, ws: null, state: "connecting" } : null,
+};
 
 let framesReceived = 0;
-let lastFrameLogTime = 0;
+let fps = 0;
+let lastFpsTime = performance.now();
+let lastVideoFrameTime = 0;
 
-ws.addEventListener("open", () => setStatus("connected, waiting for camera frames..."));
-ws.addEventListener("close", () => setStatus("disconnected"));
-ws.addEventListener("error", () => setStatus("websocket error"));
+function setStatus() {
+  const c = links.control.state;
+  let v = "none (no ?video=)";
+  if (links.video) {
+    v = links.video.state === "open" ? `${fps} fps` : links.video.state;
+    if (links.video.state === "error") v += ` -- accept the cert at https://${videoHost}/`;
+  }
+  statusEl.textContent = `control: ${c} | video: ${v}`;
+}
 
-function setStatus(msg) {
-  statusEl.textContent = msg;
+function connect(name) {
+  const link = links[name];
+  const ws = new WebSocket(link.url);
+  ws.binaryType = "arraybuffer";
+  link.ws = ws;
+  ws.addEventListener("open", () => { link.state = "open"; setStatus(); });
+  ws.addEventListener("error", () => { link.state = "error"; setStatus(); });
+  ws.addEventListener("close", () => {
+    if (link.state !== "error") link.state = "disconnected";
+    setStatus();
+    setTimeout(() => connect(name), 2000); // servers may restart; keep retrying
+  });
+  ws.addEventListener("message", (ev) => {
+    if (typeof ev.data === "string") {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "teleop_state") handleTeleopState(msg);
+      } catch (e) {
+        // ignore malformed status message
+      }
+      return;
+    }
+    if (ev.data instanceof ArrayBuffer) handleFrame(ev.data);
+  });
 }
 
 function sendPose(obj) {
-  if (ws.readyState === WebSocket.OPEN) {
+  const ws = links.control.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
 }
@@ -40,45 +83,56 @@ for (const [id, info] of Object.entries(STREAMS)) {
   const canvas = document.createElement("canvas");
   canvas.width = info.width;
   canvas.height = info.height;
+  const ctx = canvas.getContext("2d");
+  // Placeholder until the first frame arrives
+  ctx.fillStyle = "#1e1e1e";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#888888";
+  ctx.font = "bold 40px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("NO VIDEO", canvas.width / 2, canvas.height / 2 - 10);
+  ctx.font = "24px monospace";
+  ctx.fillText(info.name, canvas.width / 2, canvas.height / 2 + 30);
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  streamCanvases[id] = { canvas, ctx: canvas.getContext("2d") };
+  streamCanvases[id] = { canvas, ctx };
   streamTextures[id] = texture;
 }
 
-ws.addEventListener("message", async (ev) => {
-  if (typeof ev.data === "string") {
-    try {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === "teleop_state") handleTeleopState(msg);
-    } catch (e) {
-      // ignore malformed status message
-    }
-    return;
-  }
-  if (!(ev.data instanceof ArrayBuffer)) return;
-  const bytes = new Uint8Array(ev.data);
+async function handleFrame(buffer) {
+  const bytes = new Uint8Array(buffer);
   if (bytes.length < 2) return;
   const streamId = bytes[0];
   const entry = streamCanvases[streamId];
   if (!entry) return;
 
   framesReceived++;
+  lastVideoFrameTime = performance.now();
   const blob = new Blob([bytes.subarray(1)], { type: "image/jpeg" });
   try {
     const bitmap = await createImageBitmap(blob);
     entry.ctx.drawImage(bitmap, 0, 0, entry.canvas.width, entry.canvas.height);
     streamTextures[streamId].needsUpdate = true;
     bitmap.close();
-    const now = performance.now();
-    if (now - lastFrameLogTime > 1000) {
-      setStatus(`streaming (${framesReceived} frames received)`);
-      lastFrameLogTime = now;
-    }
   } catch (e) {
     // ignore malformed frame
   }
-});
+}
+
+setInterval(() => {
+  const now = performance.now();
+  fps = Math.round((framesReceived * 1000) / (now - lastFpsTime));
+  framesReceived = 0;
+  lastFpsTime = now;
+  setStatus();
+}, 1000);
+
+connect("control");
+if (links.video) connect("video");
+
+function videoOk() {
+  return performance.now() - lastVideoFrameTime < 1000;
+}
 
 // ---------- Three.js scene ----------
 const scene = new THREE.Scene();
@@ -262,7 +316,8 @@ function handleTeleopState(msg) {
   const l = msg.arm_enabled.left ? "ON" : "off";
   const r = msg.arm_enabled.right ? "ON" : "off";
   const color = msg.warnings && msg.warnings.length ? "#ff5555" : "#eeeeee";
-  drawHud(`${msg.state}  L:${l}  R:${r}`, color);
+  const video = videoOk() ? "" : "  NO VIDEO";
+  drawHud(`${msg.state}  L:${l}  R:${r}${video}`, color);
 
   lastTeleopState = msg;
 }

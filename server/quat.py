@@ -76,3 +76,57 @@ def yaw_pitch(q):
     yaw = np.arctan2(2 * (w * y + x * z), 1 - 2 * (y * y + x * x))
     pitch = np.arcsin(np.clip(2 * (w * x - y * z), -1.0, 1.0))
     return float(yaw), float(pitch)
+
+
+def to_matrix(q):
+    """[x,y,z,w] quaternion -> 3x3 rotation matrix."""
+    x, y, z, w = np.asarray(q, dtype=float) / np.linalg.norm(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def from_matrix(R):
+    """3x3 rotation matrix -> [x,y,z,w] quaternion (w >= 0)."""
+    R = np.asarray(R, dtype=float)
+    tr = np.trace(R)
+    if tr > 0:
+        s = 2.0 * np.sqrt(tr + 1.0)
+        q = [(R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s, 0.25 * s]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        q = [0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s, (R[2, 1] - R[1, 2]) / s]
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        q = [(R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s]
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        q = [(R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s, (R[1, 0] - R[0, 1]) / s]
+    q = np.array(q)
+    q /= np.linalg.norm(q)
+    return q if q[3] >= 0 else -q
+
+
+def rotvec_to_matrix(v):
+    """Axis-angle vector (radians) -> rotation matrix (Rodrigues)."""
+    v = np.asarray(v, dtype=float)
+    angle = np.linalg.norm(v)
+    if angle < 1e-12:
+        return np.eye(3)
+    k = v / angle
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
+
+
+def matrix_to_rotvec(R):
+    """Rotation matrix -> axis-angle vector (radians)."""
+    q = from_matrix(R)
+    s = np.linalg.norm(q[:3])
+    if s < 1e-12:
+        return np.zeros(3)
+    angle = 2.0 * np.arctan2(s, q[3])
+    return q[:3] / s * angle
