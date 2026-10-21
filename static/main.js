@@ -85,8 +85,7 @@ function sendPose(obj) {
 // Stream ids must match server/cameras.py STREAM_IDS.
 const STREAMS = {
   0: { name: "head", width: 640, height: 480 },
-  1: { name: "gripper_left", width: 640, height: 480 },
-  2: { name: "gripper_right", width: 640, height: 480 },
+  // 1 / 2 (gripper_left / gripper_right) are not shown; their frames are ignored.
 };
 
 const streamCanvases = {};
@@ -129,7 +128,13 @@ async function handleFrame(buffer) {
   const blob = new Blob([bytes.subarray(1)], { type: "image/jpeg" });
   try {
     const bitmap = await createImageBitmap(blob);
-    entry.ctx.drawImage(bitmap, 0, 0, entry.canvas.width, entry.canvas.height);
+    // Match the canvas to the stream, so a higher-res camera isn't squashed to 640x480.
+    if (entry.canvas.width !== bitmap.width || entry.canvas.height !== bitmap.height) {
+      entry.canvas.width = bitmap.width;
+      entry.canvas.height = bitmap.height;
+      streamTextures[streamId].dispose(); // reallocate at the new size
+    }
+    entry.ctx.drawImage(bitmap, 0, 0);
     streamTextures[streamId].needsUpdate = true;
     bitmap.close();
   } catch (e) {
@@ -182,11 +187,9 @@ window.addEventListener("resize", () => {
 // Light so controller meshes are visible
 scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.5));
 
-// Head-locked screens: one big "head/ZED camera" view straight ahead, plus
-// two small gripper-camera insets in the lower corners. Each is
-// repositioned/reoriented every frame to a fixed offset from the head pose
-// (see animation loop), so they follow you like a HUD instead of staying
-// fixed in the room.
+// Head-locked screen: the mono "head" camera view straight ahead (hidden while
+// the stereo ZED view is live). Repositioned every frame to a fixed offset
+// from the head pose (see animation loop), so it follows you like a HUD.
 function makeScreen(streamId, width, height) {
   const geo = new THREE.PlaneGeometry(width, height);
   const mat = new THREE.MeshBasicMaterial({ map: streamTextures[streamId] });
@@ -196,15 +199,9 @@ function makeScreen(streamId, width, height) {
 }
 
 const headScreen = makeScreen(0, 1.0, 0.75);
-const leftGripperScreen = makeScreen(1, 0.32, 0.24);
-const rightGripperScreen = makeScreen(2, 0.32, 0.24);
 
-// Offsets from the head, in head-local space (meters): main view straight
-// ahead/slightly below eye line; gripper insets low in the left/right
-// periphery.
+// Offset from the head, in head-local space (meters): straight ahead, slightly below eye line.
 const HEAD_SCREEN_OFFSET = new THREE.Vector3(0, -0.05, -1.2);
-const LEFT_GRIPPER_OFFSET = new THREE.Vector3(-0.45, -0.3, -1.0);
-const RIGHT_GRIPPER_OFFSET = new THREE.Vector3(0.45, -0.3, -1.0);
 
 // ---------- Stereo ZED view (stream 3: rectified left|right side by side) ----------
 // Each eye gets its own head-locked plane showing its half of the frame:
@@ -244,7 +241,7 @@ function makeEyePlane(layer, u0) {
   const uv = geo.attributes.uv;
   for (let i = 0; i < uv.count; i++) uv.setX(i, u0 + 0.5 * uv.getX(i)); // this eye's half
   uv.needsUpdate = true;
-  // Background: drawn first with no depth test, so HUD, insets and controllers draw over it.
+  // Background: drawn first with no depth test, so HUD and controllers draw over it.
   const mat = new THREE.MeshBasicMaterial({ map: stereoTexture, depthTest: false, depthWrite: false });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.layers.set(layer);
@@ -429,8 +426,8 @@ function hapticPulse(hand, intensity, durationMs) {
 
 // ---------- Halo HUD ----------
 // Head-locked status ring around the edge of view; the centre stays clear for
-// the video. Panels: top (mode, links, REC/IPD, neck pan/tilt tape), left/right
-// (arm clutch, IK, gripper gauge), bottom (lift height, base motion, task),
+// the video. Panels: top (mode, links, REC/IPD), left/right (arm clutch,
+// gripper gauge), bottom (lift height, base motion, task -- each only when it has data),
 // plus a pulsing alert banner. Each panel is a small canvas texture, redrawn
 // only when what it shows changes (checked at HUD_RATE_HZ).
 // Robot fields come from teleop_state.robot (robot/whole_body_teleop.py
@@ -457,7 +454,7 @@ function makeHudPanel({ px, widthM, offset, yawDeg = 0, view, draw }) {
     new THREE.PlaneGeometry(widthM, (widthM * px[1]) / px[0]),
     new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
   );
-  mesh.renderOrder = 10; // over the video and the gripper insets
+  mesh.renderOrder = 10; // over the video
   scene.add(mesh);
   const panel = {
     ctx: canvas.getContext("2d"), canvas, texture, mesh, offset, view, draw, key: null,
@@ -571,11 +568,10 @@ function hudModel() {
   return { s, r, alerts };
 }
 
-// --- top: mode chip, links, REC / IPD, neck tape
+// --- top: mode chip, links, REC / IPD
 const topPanel = makeHudPanel({
-  px: [1024, 240], widthM: 0.9, offset: new THREE.Vector3(0, 0.4, -HUD_DIST),
+  px: [1024, 120], widthM: 0.9, offset: new THREE.Vector3(0, 0.45, -HUD_DIST),
   view: ({ s, r }) => {
-    const n = r && r.neck;
     const rec = s && s.recording && s.recording.active ? s.recording : null;
     return {
       mode: s ? String(s.state) : "NO LINK",
@@ -583,14 +579,12 @@ const topPanel = makeHudPanel({
       ctrl: links.control.state,
       vid: !links.video ? "OFF" : videoOk() ? `${fps} FPS` : links.video.state.toUpperCase(),
       vidOk: !links.video || videoOk(),
-      stereo: stereoActive(),
       ipd: performance.now() < ipdShownUntil && ipdMm !== null ? ipdMm.toFixed(1) : null,
       rec: rec ? { ep: rec.episode ?? null, t: Math.floor(rec.elapsed_s || 0) } : null,
-      neck: n && n.pan !== null ? { pan: Math.round(n.pan), tilt: Math.round(n.tilt), pl: n.pan_lim, tl: n.tilt_lim } : null,
     };
   },
   draw: (ctx, W, H, v) => {
-    // Row 1: links (left), mode chip (centre), REC / IPD (right)
+    // links (left), mode chip (centre), REC / IPD (right)
     const ctrlOk = v.ctrl === "open";
     ctx.fillStyle = ctrlOk ? C.green : C.red;
     ctx.shadowColor = ctx.fillStyle;
@@ -601,7 +595,6 @@ const topPanel = makeHudPanel({
     ctx.shadowBlur = 0;
     glowText(ctx, "CTRL", 66, 44, { size: 26, color: ctrlOk ? C.cyan : C.red });
     glowText(ctx, `VID ${v.vid}`, 160, 44, { size: 26, color: v.vidOk ? C.cyan : C.amber });
-    if (v.stereo) glowText(ctx, "3D", 340, 44, { size: 26, color: C.green });
 
     const color = modeColor(v.mode);
     const modeSize = v.mode.length > 12 ? 28 : 36;
@@ -632,63 +625,6 @@ const topPanel = makeHudPanel({
       ctx.fill();
       ctx.shadowBlur = 0;
     }
-
-    // Row 2: neck pan tape (x = pan) + tilt ladder on the right
-    const x0 = 170, x1 = 820, yT = 178;
-    const n = v.neck;
-    const lineColor = n ? C.dim : C.faint;
-    glowPath(ctx, lineColor, 2, () => {
-      ctx.moveTo(x0, yT);
-      ctx.lineTo(x1, yT);
-    });
-    glowText(ctx, "PAN", 70, yT, { size: 22, color: n ? C.dim : C.faint });
-    if (!n) {
-      glowText(ctx, "NECK --", 512, yT - 32, { size: 24, color: C.grey, align: "center" });
-      return;
-    }
-    const [plo, phi] = n.pl;
-    const px = (deg) => x0 + ((deg - plo) / (phi - plo)) * (x1 - x0);
-    for (let d = Math.ceil(plo / 10) * 10; d <= phi; d += 10) {
-      const major = d % 30 === 0;
-      glowPath(ctx, major ? C.dim : C.faint, 2, () => {
-        ctx.moveTo(px(d), yT);
-        ctx.lineTo(px(d), yT + (major ? 18 : 10));
-      });
-      if (major) glowText(ctx, `${d}`, px(d), yT + 36, { size: 18, color: C.dim, align: "center", weight: 400 });
-    }
-    for (const lim of [plo, phi]) {
-      glowPath(ctx, C.amber, 3, () => {
-        ctx.moveTo(px(lim), yT - 18);
-        ctx.lineTo(px(lim), yT + 18);
-      });
-    }
-    const nearPan = Math.min(n.pan - plo, phi - n.pan) < 5;
-    const panX = px(Math.min(phi, Math.max(plo, n.pan)));
-    triangle(ctx, panX, yT - 4, 10, true, nearPan ? C.amber : C.cyan);
-    glowText(ctx, fmtDeg(n.pan), panX, yT - 40, { size: 26, color: nearPan ? C.amber : C.text, align: "center" });
-
-    const [tlo, thi] = n.tl;
-    const lx = 890, ly0 = 116, ly1 = 226;
-    const ty = (deg) => ly0 + ((deg - tlo) / (thi - tlo)) * (ly1 - ly0); // + tilt = down on this neck
-    glowPath(ctx, C.dim, 2, () => {
-      ctx.moveTo(lx, ly0);
-      ctx.lineTo(lx, ly1);
-    });
-    for (const lim of [tlo, thi]) {
-      glowPath(ctx, C.amber, 3, () => {
-        ctx.moveTo(lx - 12, ty(lim));
-        ctx.lineTo(lx + 12, ty(lim));
-      });
-    }
-    const nearTilt = Math.min(n.tilt - tlo, thi - n.tilt) < 5;
-    const tiltY = ty(Math.min(thi, Math.max(tlo, n.tilt)));
-    ctx.save();
-    ctx.translate(lx - 8, tiltY);
-    ctx.rotate(-Math.PI / 2);
-    triangle(ctx, 0, 0, 9, true, nearTilt ? C.amber : C.cyan);
-    ctx.restore();
-    glowText(ctx, "TILT", lx + 24, 136, { size: 22, color: C.dim });
-    glowText(ctx, fmtDeg(n.tilt), lx + 24, 176, { size: 26, color: nearTilt ? C.amber : C.text });
   },
 });
 
@@ -703,7 +639,6 @@ function makeArmPanel(side) {
       on: !!(s && s.arm_enabled && s.arm_enabled[side]),
       lost: !!(s && (s.warnings || []).includes(`${side}_tracking_lost`)),
       robot: !!r,
-      ik: r && r.ik_ok ? r.ik_ok[side] ?? null : null,
       grip: r && r.gripper && r.gripper[side] != null ? Math.round(100 * clamp01(r.gripper[side])) : null,
     }),
     draw: (ctx, W, H, v) => {
@@ -718,23 +653,18 @@ function makeArmPanel(side) {
       for (const [a, b] of gaps) {
         glowPath(ctx, arcColor, v.on ? 5 : 3, () => ctx.arc(cx, cy, R, mid + a * span, mid + b * span));
       }
-      glowPath(ctx, C.faint, 2, () => ctx.arc(cx, cy, R - 16, mid - 0.9 * span, mid + 0.9 * span));
 
       const tx = L ? 120 : W - 120;
       const align = L ? "left" : "right";
       glowText(ctx, `${L ? "L" : "R"} ARM`, tx, 72, { size: 34, color: C.text, align, weight: 700 });
       glowText(ctx, status[0], tx, 122, { size: 28, color: status[1], align });
-      const ik = v.ik === null ? ["IK --", C.grey] : v.ik ? ["IK OK", C.dim] : ["IK LIMIT", C.amber];
-      glowText(ctx, ik[0], tx, 166, { size: 24, color: ik[1], align });
 
-      // gripper gauge: 270° ring, fill = % open
+      // gripper gauge: 270° ring, fill = % open (none when this arm has no gripper)
+      if (v.grip === null) return;
       const gx = L ? 195 : W - 195, gy = 380, gr = 82;
       const a0 = 0.75 * Math.PI, sweep = 1.5 * Math.PI;
       glowPath(ctx, C.faint, 14, () => ctx.arc(gx, gy, gr, a0, a0 + sweep));
-      if (v.grip === null) {
-        glowText(ctx, "NO", gx, gy - 16, { size: 26, color: C.grey, align: "center" });
-        glowText(ctx, "GRIP", gx, gy + 16, { size: 26, color: C.grey, align: "center" });
-      } else {
+      {
         const fill = v.grip / 100;
         if (fill > 0.005) glowPath(ctx, v.on ? C.cyan : C.dim, 14, () => ctx.arc(gx, gy, gr, a0, a0 + fill * sweep));
         for (let i = 0; i <= 10; i++) { // tick every 10 %
@@ -747,7 +677,7 @@ function makeArmPanel(side) {
         glowText(ctx, `${v.grip}%`, gx, gy - 8, { size: 38, color: C.text, align: "center", weight: 700 });
         glowText(ctx, "OPEN", gx, gy + 28, { size: 20, color: C.dim, align: "center" });
       }
-      glowText(ctx, "GRIPPER", gx, gy + gr + 50, { size: 22, color: v.grip === null ? C.faint : C.dim, align: "center" });
+      glowText(ctx, "GRIPPER", gx, gy + gr + 50, { size: 22, color: C.dim, align: "center" });
     },
   });
 }
@@ -769,28 +699,28 @@ const bottomPanel = makeHudPanel({
     };
   },
   draw: (ctx, W, H, v) => {
-    // lift: 20-segment bar
+    // lift: 20-segment bar (hidden with no height reading)
     const bx = 60, by = 78, bw = 400, bh = 26, n = 20;
-    glowText(ctx, "LIFT", bx, 46, { size: 24, color: v.lift ? C.dim : C.faint });
-    if (v.liftDir) glowText(ctx, v.liftDir === "up" ? "▲ UP" : "▼ DOWN", bx + 90, 46, { size: 24, color: C.amber, weight: 700 });
-    const frac = v.lift ? clamp01((v.lift.h / 1000 - v.lift.min) / (v.lift.max - v.lift.min)) : 0;
-    for (let i = 0; i < n; i++) {
-      const lit = v.lift && (i + 0.5) / n <= frac;
-      ctx.fillStyle = lit ? C.cyan : C.faint;
-      ctx.shadowColor = C.cyan;
-      ctx.shadowBlur = lit ? 8 : 0;
-      ctx.fillRect(bx + (i * bw) / n + 2, by, bw / n - 4, bh);
+    if (v.lift) {
+      glowText(ctx, "LIFT", bx, 46, { size: 24, color: C.dim });
+      if (v.liftDir) glowText(ctx, v.liftDir === "up" ? "▲ UP" : "▼ DOWN", bx + 90, 46, { size: 24, color: C.amber, weight: 700 });
+      const frac = clamp01((v.lift.h / 1000 - v.lift.min) / (v.lift.max - v.lift.min));
+      for (let i = 0; i < n; i++) {
+        const lit = (i + 0.5) / n <= frac;
+        ctx.fillStyle = lit ? C.cyan : C.faint;
+        ctx.shadowColor = C.cyan;
+        ctx.shadowBlur = lit ? 8 : 0;
+        ctx.fillRect(bx + (i * bw) / n + 2, by, bw / n - 4, bh);
+      }
+      ctx.shadowBlur = 0;
+      glowText(ctx, `${(v.lift.h / 1000).toFixed(3)} M`, bx, 136, { size: 26, color: C.text });
     }
-    ctx.shadowBlur = 0;
-    glowText(ctx, v.lift ? `${(v.lift.h / 1000).toFixed(3)} M` : "--", bx, 136, { size: 26, color: v.lift ? C.text : C.grey });
 
-    // base: direction dial (robot x forward = up, y left = left) + numbers
+    // base: direction dial (robot x forward = up, y left = left) + numbers, only in base mode
     const dx = 690, dy = 92, dr = 52;
-    glowPath(ctx, v.base ? C.dim : C.faint, 2, () => ctx.arc(dx, dy, dr, 0, 2 * Math.PI));
-    glowText(ctx, "BASE", W - 60, 46, { size: 24, color: v.base ? C.amber : C.faint, align: "right" });
-    if (!v.base) {
-      glowText(ctx, "PARKED", W - 60, 92, { size: 26, color: C.grey, align: "right" });
-    } else {
+    if (v.base) {
+      glowPath(ctx, C.dim, 2, () => ctx.arc(dx, dy, dr, 0, 2 * Math.PI));
+      glowText(ctx, "BASE", W - 60, 46, { size: 24, color: C.amber, align: "right" });
       const [vx, vy, wz] = v.base;
       const speed = Math.hypot(vx, vy);
       if (speed > 0.005) {
@@ -940,10 +870,8 @@ renderer.setAnimationLoop((timestamp, frame) => {
       }
       placeEyePlanes(tmpPos, tmpQuat);
 
-      // Head-lock all three screens + status HUD to this frame's head pose.
+      // Head-lock the screen + status HUD to this frame's head pose.
       headLock(headScreen, HEAD_SCREEN_OFFSET, tmpPos, tmpQuat);
-      headLock(leftGripperScreen, LEFT_GRIPPER_OFFSET, tmpPos, tmpQuat);
-      headLock(rightGripperScreen, RIGHT_GRIPPER_OFFSET, tmpPos, tmpQuat);
       placeHud(tmpPos, tmpQuat, timestamp);
     }
 
@@ -968,8 +896,6 @@ renderer.setAnimationLoop((timestamp, frame) => {
   if (!frame) {
     // Not in VR (desktop preview): lock the screens + HUD to the page camera.
     headLock(headScreen, HEAD_SCREEN_OFFSET, camera.position, camera.quaternion);
-    headLock(leftGripperScreen, LEFT_GRIPPER_OFFSET, camera.position, camera.quaternion);
-    headLock(rightGripperScreen, RIGHT_GRIPPER_OFFSET, camera.position, camera.quaternion);
     placeHud(camera.position, camera.quaternion, timestamp);
   }
   renderer.render(scene, camera);

@@ -43,11 +43,12 @@ STREAM_IDS = {"head": 0, "gripper_left": 1, "gripper_right": 2, "head_stereo": 3
 DEFAULTS = {"width": 640, "height": 480, "fps": 20, "jpeg_quality": 70}
 STUB_FPS = 2  # placeholder frames are static, no need to push them fast
 
-# Used when no config file is given: head = first V4L2/DirectShow camera, grippers stubbed.
+# Used when no config file is given: head = first V4L2/DirectShow camera. The headset
+# page no longer shows gripper cameras, so they are off unless a config turns them on.
 DEFAULT_CONFIG = {
     "head": {"type": "opencv", "device": 0},
-    "gripper_left": {"type": "stub"},
-    "gripper_right": {"type": "stub"},
+    "gripper_left": {"type": "none"},
+    "gripper_right": {"type": "none"},
     "head_stereo": {"type": "none"},
 }
 
@@ -59,8 +60,8 @@ def load_config(path=None):
     unknown = set(cfg) - set(STREAM_IDS)
     if unknown:
         raise ValueError(f"unknown stream(s) {sorted(unknown)}; valid: {sorted(STREAM_IDS)}")
-    # head_stereo is optional: absent means no stereo stream (the headset shows mono "head").
-    return {name: cfg.get(name, {"type": "none" if name == "head_stereo" else "stub"}) for name in STREAM_IDS}
+    # Only "head" falls back to a stub; absent head_stereo / gripper streams are off.
+    return {name: cfg.get(name, {"type": "stub" if name == "head" else "none"}) for name in STREAM_IDS}
 
 
 def _encode(frame, quality) -> bytes:

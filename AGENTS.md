@@ -91,6 +91,13 @@ launcher come next. Constants marked VERIFY (XR->robot axes, neck signs, lift
 travel/band/speed) are unvalidated on hardware.
 Tests: `python tests/test_whole_body.py` (also pytest-compatible).
 
+`server/yor_bridge.py` is the robot bridge: it serves the page, runs
+`WholeBodyTeleop` at 30 Hz and drives the robot through yor.py's RPC. The YOR
+repo's `robot/whole_body_teleop.py` is a thin launcher for it (Orin video
+address + neck calibration file). The exact RPC calls, frames and units are in
+`docs/YOR_RPC_INTERFACE.md` -- a simulator that serves those calls can run the
+unchanged bridge (`python server/yor_bridge.py --rpc-host localhost`).
+
 ## Two-machine setup (current)
 The robot Pi serves the page and runs control (no video); the Orin runs
 `server/server.py --video-only --port 8444` for camera feeds. The page opens

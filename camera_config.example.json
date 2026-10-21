@@ -1,6 +1,6 @@
 {
   "head": {"type": "stub"},
   "head_stereo": {"type": "zed", "view": "side_by_side", "resolution": "HD720", "width": 960, "height": 540, "fps": 30, "jpeg_quality": 75},
-  "gripper_left": {"type": "stub"},
-  "gripper_right": {"type": "opencv", "device": "/dev/v4l/by-id/REPLACE-right-wrist-cam-video-index0", "fourcc": "MJPG", "fps": 30}
+  "gripper_left": {"type": "none"},
+  "gripper_right": {"type": "none"}
 }
