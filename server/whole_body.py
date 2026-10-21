@@ -13,6 +13,9 @@ Controls (Quest Touch, WebXR "xr-standard" mapping):
                       release and the arm holds where it is
   index trigger       gripper close amount (0 open .. 1 closed), sent while clutched
   B + Y together      toggle base mode (the upper face buttons)
+  A + Y (hold)        lift down; stops on release
+  X + B (hold)        lift up; stops on release (both need teleop on, and exactly
+                      those two face buttons: any other mix stops the lift)
   left stick          base vx / vy (base mode)
   right stick x       base yaw rate (base mode)
   left stick click    recenter the neck's "straight ahead"
@@ -92,6 +95,7 @@ class WholeBodyConfig:
     # teleop on/off switch (A + X, one on each controller)
     start_enabled: bool = False
     home_hold_s: float = 1.5  # hold A + X this long to home everything
+    enable_lift_buttons: bool = True  # A + Y lift down, X + B lift up
 
 
 # ------------------------------------------------------------------ helpers
@@ -191,6 +195,7 @@ class WholeBodyTeleop:
         self.enabled = self.cfg.start_enabled
         self._combo_start = None  # when A + X became held together
         self._combo_fired = False  # the hold already fired "home" for this press
+        self.lift_manual = None  # "up" | "down" | None, from A + Y / X + B
 
     # ------------------------------------------------------------ public API
     def update(self, payload, robot_state, now_s):
@@ -230,6 +235,8 @@ class WholeBodyTeleop:
         commands["base_mode"], commands["base_velocity"] = self._update_base(ctrls)
         commands["neck"] = self._update_neck(head, ctrls["left"], robot_state, dt)
         commands["lift_target"] = self._update_lift(head, robot_state, dt)
+        self.lift_manual = self._update_lift_buttons(ctrls)
+        commands["lift_manual"] = self.lift_manual
         return commands
 
     def set_enabled(self, on):
@@ -270,6 +277,8 @@ class WholeBodyTeleop:
             modes.append("BASE")
         if self.lift.active:
             modes.append("LIFT")
+        if self.lift_manual:
+            modes.append(f"LIFT {self.lift_manual.upper()}")
         return {
             "type": "teleop_state",
             "state": "+".join(modes) or "ON",
@@ -438,6 +447,21 @@ class WholeBodyTeleop:
             -lx * cfg.max_base_linear_mps,  # stick left (x < 0) -> +y
             -rx * cfg.max_base_yaw_rps,  # stick left -> turn left (+yaw)
         ]
+
+    # ------------------------------------------------------------------ lift buttons
+    def _update_lift_buttons(self, ctrls):
+        """A + Y held -> "down", X + B held -> "up", else None (stop). Exactly those two
+        face buttons, so a sloppy press into A + X / B + Y never moves the lift."""
+        left, right = ctrls["left"], ctrls["right"]
+        if not (self.enabled and self.cfg.enable_lift_buttons) or left is None or right is None:
+            return None  # also on tracking dropout: stop rather than guess
+        x, y = _button(left, PRIMARY_BUTTON)[0], _button(left, SECONDARY_BUTTON)[0]
+        a, b = _button(right, PRIMARY_BUTTON)[0], _button(right, SECONDARY_BUTTON)[0]
+        if a and y and not x and not b:
+            return "down"
+        if x and b and not a and not y:
+            return "up"
+        return None
 
     # ------------------------------------------------------------------ neck
     def _update_neck(self, head, left, robot_state, dt):

@@ -465,3 +465,36 @@ if __name__ == "__main__":
             print(f"FAIL  {name}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
+
+
+def lift_press(left_buttons, right_buttons):
+    return payload(left=ctrl([0, 1, 0], buttons=left_buttons), right=ctrl([0, 1.2, 0], buttons=right_buttons))
+
+
+def test_lift_buttons():
+    tele, clk = make(), Clock()
+    assert run(tele, clk, lift_press((5,), (4,)))["lift_manual"] == "down"  # Y + A
+    assert tele.status()["state"].endswith("LIFT DOWN")
+    assert run(tele, clk, lift_press((4,), (5,)))["lift_manual"] == "up"  # X + B
+    assert run(tele, clk, idle())["lift_manual"] is None  # release stops
+    for lb, rb in (((5,), ()), ((), (4,)), ((4, 5), (4,)), ((5,), (4, 5)), ((4,), (4,)), ((5,), (5,))):
+        assert run(tele, clk, lift_press(lb, rb))["lift_manual"] is None, (lb, rb)
+        run(tele, clk, idle())
+
+
+def test_lift_buttons_need_teleop_on_and_tracking():
+    tele, clk = make(start_enabled=False), Clock()
+    assert run(tele, clk, lift_press((5,), (4,)))["lift_manual"] is None
+    tele, clk = make(), Clock()
+    run(tele, clk, lift_press((4,), (5,)))
+    out = run(tele, clk, payload(left=ctrl([0, 1, 0], buttons=(4,))))  # right controller lost
+    assert out["lift_manual"] is None
+
+
+def test_lift_combos_do_not_trigger_toggles():
+    tele, clk = make(), Clock()
+    for _ in range(3):
+        run(tele, clk, lift_press((5,), (4,)), ticks=3)
+        run(tele, clk, lift_press((4,), (5,)), ticks=3)
+        run(tele, clk, idle())
+    assert tele.enabled and not tele.base_mode

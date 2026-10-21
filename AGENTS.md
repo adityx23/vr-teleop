@@ -104,4 +104,15 @@ server also sends a `stereo_info` JSON message with per-eye intrinsics.
 `static/main.js` shows each half to one eye only (three.js XR layers 1/2),
 true scale from fx/fy/cx/cy, eye planes `ipd` apart. IPD: right stick up/down
 (not in base mode), right stick click resets to the headset's measured IPD,
-stored in localStorage, `?ipd=<mm>` overrides.
+stored in localStorage, `?ipd=<mm>` overrides. Both eye planes are shifted
+down to the vertical centre of the headset's eye frustums (Quest sees further
+down than up); `?center=0` turns that off.
+
+## HUD
+`static/main.js` "Halo HUD": head-locked canvas panels (top: mode/links/REC/
+neck tape; sides: arm clutch, IK, gripper gauge; bottom: lift, base, task;
+alert banner). Each redraws only when its view changes. Data: the
+`teleop_state` message plus optional `robot` (from
+`robot/whole_body_teleop.py` `RobotLink.hud()`, polled at 5 Hz off the control
+path) and optional `recording: {active, episode, elapsed_s, task}` (nothing
+sends it yet). Open the page in a desktop browser to preview it without VR.

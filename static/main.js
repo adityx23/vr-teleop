@@ -221,6 +221,12 @@ const IPD_MIN_MM = 40;
 const IPD_MAX_MM = 90;
 const IPD_RATE_MM_S = 8; // at full stick deflection
 const IPD_STORAGE_KEY = "vrteleop.ipd_mm";
+// Headset per-eye views are vertically asymmetric (Quest sees further down
+// than up), so a plane centred on "straight ahead" leaves a bigger empty band
+// at the bottom. Shift both planes (same amount, so no vertical disparity) to
+// the vertical centre of the eye frustums. ?center=0 turns this off.
+const CENTER_IN_VIEW = new URLSearchParams(location.search).get("center") !== "0";
+let viewCenterTanY = 0; // tan of the frustum's vertical centre angle (+ = up)
 
 // Until the video server sends calibration: ZED 2 at HD720 (fx ~ 530 px at 1280x720).
 let stereoInfo = { width: 1280, height: 720, fx: 530, fy: 530, cx: 640, cy: 360, baseline_m: 0.12, model: "default" };
@@ -336,7 +342,7 @@ function placeEyePlanes(headPos, headQuat) {
   const w = (D * W) / fx;
   const h = (D * H) / fy;
   const ox = (D * (W / 2 - cx)) / fx; // principal point offset (image y is down)
-  const oy = (D * (cy - H / 2)) / fy;
+  const oy = (D * (cy - H / 2)) / fy + (CENTER_IN_VIEW ? D * viewCenterTanY : 0);
   const half = (ipdMm ?? 63) / 2000; // m
   for (const [mesh, side] of [[leftEyePlane, -1], [rightEyePlane, 1]]) {
     mesh.scale.set(w, h, 1);
@@ -421,32 +427,437 @@ function hapticPulse(hand, intensity, durationMs) {
   }
 }
 
-// ---------- Head-locked status HUD ----------
-const hudCanvas = document.createElement("canvas");
-hudCanvas.width = 512;
-hudCanvas.height = 128;
-const hudCtx = hudCanvas.getContext("2d");
-const hudTexture = new THREE.CanvasTexture(hudCanvas);
-const hudMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.5, 0.125),
-  new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true })
-);
-scene.add(hudMesh);
-const HUD_OFFSET = new THREE.Vector3(0, 0.38, -1.2);
+// ---------- Halo HUD ----------
+// Head-locked status ring around the edge of view; the centre stays clear for
+// the video. Panels: top (mode, links, REC/IPD, neck pan/tilt tape), left/right
+// (arm clutch, IK, gripper gauge), bottom (lift height, base motion, task),
+// plus a pulsing alert banner. Each panel is a small canvas texture, redrawn
+// only when what it shows changes (checked at HUD_RATE_HZ).
+// Robot fields come from teleop_state.robot (robot/whole_body_teleop.py
+// RobotLink.hud()) and teleop_state.recording; both optional -- whatever the
+// server doesn't send is shown as "--" or left out.
+const HUD_DIST = 1.4; // m in front of the eyes
+const HUD_RATE_HZ = 10;
+const C = {
+  cyan: "#5ff4ff", dim: "rgba(95,244,255,0.60)", faint: "rgba(95,244,255,0.14)",
+  text: "#dffcff", green: "#6dff9c", amber: "#ffb347", red: "#ff4d5e", grey: "#8a99a3",
+};
+const HUD_FONT = '"Roboto Mono", "DejaVu Sans Mono", "Courier New", monospace';
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
 
-function drawHud(text, color) {
-  hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
-  hudCtx.fillStyle = "rgba(10,12,15,0.6)";
-  hudCtx.fillRect(0, 0, hudCanvas.width, hudCanvas.height);
-  hudCtx.font = "bold 36px monospace";
-  hudCtx.fillStyle = color;
-  hudCtx.textAlign = "center";
-  hudCtx.textBaseline = "middle";
-  hudCtx.fillText(text, hudCanvas.width / 2, hudCanvas.height / 2);
-  hudTexture.needsUpdate = true;
+const hudPanels = [];
+function makeHudPanel({ px, widthM, offset, yawDeg = 0, view, draw }) {
+  const canvas = document.createElement("canvas");
+  canvas.width = px[0];
+  canvas.height = px[1];
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = 4;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(widthM, (widthM * px[1]) / px[0]),
+    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false })
+  );
+  mesh.renderOrder = 10; // over the video and the gripper insets
+  scene.add(mesh);
+  const panel = {
+    ctx: canvas.getContext("2d"), canvas, texture, mesh, offset, view, draw, key: null,
+    turn: new THREE.Quaternion().setFromAxisAngle(Y_AXIS, THREE.MathUtils.degToRad(yawDeg)),
+  };
+  hudPanels.push(panel);
+  return panel;
 }
 
-drawHud("STATE: IDLE", "#aaaaaa");
+// --- drawing helpers
+function glowText(ctx, text, x, y, { size = 28, color = C.cyan, align = "left", weight = 600 } = {}) {
+  ctx.font = `${weight} ${size}px ${HUD_FONT}`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = Math.max(2, size / 8);
+  ctx.strokeStyle = "rgba(0,8,12,0.75)"; // dark outline: readable over bright video
+  ctx.strokeText(text, x, y);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = size / 3;
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function glowPath(ctx, color, width, path) {
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = width + 4;
+  ctx.strokeStyle = "rgba(0,8,12,0.5)";
+  ctx.beginPath();
+  path();
+  ctx.stroke();
+  ctx.lineWidth = width;
+  ctx.strokeStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 10;
+  ctx.beginPath();
+  path();
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+}
+
+function chamfer(ctx, x, y, w, h, c) {
+  ctx.moveTo(x + c, y);
+  ctx.lineTo(x + w - c, y);
+  ctx.lineTo(x + w, y + c);
+  ctx.lineTo(x + w, y + h - c);
+  ctx.lineTo(x + w - c, y + h);
+  ctx.lineTo(x + c, y + h);
+  ctx.lineTo(x, y + h - c);
+  ctx.lineTo(x, y + c);
+  ctx.closePath();
+}
+
+function scrim(ctx, x, y, w, h, c = 14) {
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "rgba(2,14,20,0.42)";
+  ctx.beginPath();
+  chamfer(ctx, x, y, w, h, c);
+  ctx.fill();
+}
+
+function triangle(ctx, x, y, size, down, color) {
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x - size, y + (down ? -size * 1.4 : size * 1.4));
+  ctx.lineTo(x + size, y + (down ? -size * 1.4 : size * 1.4));
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+}
+
+const sgn = (v) => (v >= 0 ? "+" : "-");
+const fmtDeg = (v) => `${sgn(v)}${String(Math.abs(Math.round(v))).padStart(2, "0")}°`;
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+// --- model: everything the panels show, gathered once per HUD tick
+const WARNING_TEXT = {
+  left_tracking_lost: ["L CONTROLLER TRACKING LOST", "red"],
+  right_tracking_lost: ["R CONTROLLER TRACKING LOST", "red"],
+  left_no_ee_pose: ["L ARM POSE UNAVAILABLE", "amber"],
+  right_no_ee_pose: ["R ARM POSE UNAVAILABLE", "amber"],
+};
+
+const MODE_COLOR = { OFF: C.grey, ON: C.cyan, HOMING: C.amber };
+function modeColor(state) {
+  if (MODE_COLOR[state]) return MODE_COLOR[state];
+  if (state.includes("LIFT ")) return C.amber;
+  if (state.includes("BASE")) return C.amber;
+  if (state.includes("ARMS")) return C.green;
+  return C.cyan;
+}
+
+function hudModel() {
+  const s = lastTeleopState;
+  const r = (s && s.robot) || null;
+  const alerts = [];
+  if (links.control.state !== "open") alerts.push([`CONTROL LINK ${links.control.state.toUpperCase()}`, "red"]);
+  if (r && !r.rpc_ok) alerts.push([r.error ? `ROBOT: ${r.error}`.slice(0, 44).toUpperCase() : "ROBOT LINK STALLED", "red"]);
+  for (const w of (s && s.warnings) || []) alerts.push(WARNING_TEXT[w] || [w.replace(/_/g, " ").toUpperCase(), "amber"]);
+  for (const side of ["left", "right"]) {
+    if (s && s.arm_enabled && s.arm_enabled[side] && r && r.ik_ok && r.ik_ok[side] === false) {
+      alerts.push([`${side[0].toUpperCase()} ARM AT REACH / JOINT LIMIT`, "amber"]);
+    }
+  }
+  if (links.video && !videoOk()) alerts.push(["NO VIDEO", "amber"]);
+  return { s, r, alerts };
+}
+
+// --- top: mode chip, links, REC / IPD, neck tape
+const topPanel = makeHudPanel({
+  px: [1024, 240], widthM: 0.9, offset: new THREE.Vector3(0, 0.4, -HUD_DIST),
+  view: ({ s, r }) => {
+    const n = r && r.neck;
+    const rec = s && s.recording && s.recording.active ? s.recording : null;
+    return {
+      mode: s ? String(s.state) : "NO LINK",
+      dry: !!(r && r.dry_run),
+      ctrl: links.control.state,
+      vid: !links.video ? "OFF" : videoOk() ? `${fps} FPS` : links.video.state.toUpperCase(),
+      vidOk: !links.video || videoOk(),
+      stereo: stereoActive(),
+      ipd: performance.now() < ipdShownUntil && ipdMm !== null ? ipdMm.toFixed(1) : null,
+      rec: rec ? { ep: rec.episode ?? null, t: Math.floor(rec.elapsed_s || 0) } : null,
+      neck: n && n.pan !== null ? { pan: Math.round(n.pan), tilt: Math.round(n.tilt), pl: n.pan_lim, tl: n.tilt_lim } : null,
+    };
+  },
+  draw: (ctx, W, H, v) => {
+    // Row 1: links (left), mode chip (centre), REC / IPD (right)
+    const ctrlOk = v.ctrl === "open";
+    ctx.fillStyle = ctrlOk ? C.green : C.red;
+    ctx.shadowColor = ctx.fillStyle;
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(48, 44, 9, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    glowText(ctx, "CTRL", 66, 44, { size: 26, color: ctrlOk ? C.cyan : C.red });
+    glowText(ctx, `VID ${v.vid}`, 160, 44, { size: 26, color: v.vidOk ? C.cyan : C.amber });
+    if (v.stereo) glowText(ctx, "3D", 340, 44, { size: 26, color: C.green });
+
+    const color = modeColor(v.mode);
+    const modeSize = v.mode.length > 12 ? 28 : 36;
+    ctx.font = `700 ${modeSize}px ${HUD_FONT}`;
+    const chipW = Math.min(340, Math.max(240, ctx.measureText(v.mode).width + 48));
+    const chipX = 512 - chipW / 2;
+    glowPath(ctx, color, 3, () => chamfer(ctx, chipX, 12, chipW, 64, 16));
+    ctx.fillStyle = "rgba(2,14,20,0.45)";
+    ctx.beginPath();
+    chamfer(ctx, chipX, 12, chipW, 64, 16);
+    ctx.fill();
+    glowText(ctx, v.mode, 512, 45, { size: modeSize, color, align: "center", weight: 700 });
+    if (v.dry) glowText(ctx, "DRY RUN", 512, 92, { size: 20, color: C.amber, align: "center" });
+
+    if (v.ipd !== null) {
+      glowText(ctx, `IPD ${v.ipd} MM`, W - 40, 44, { size: 28, color: C.text, align: "right" });
+    } else if (v.rec) {
+      const mm = String(Math.floor(v.rec.t / 60)).padStart(2, "0");
+      const ss = String(v.rec.t % 60).padStart(2, "0");
+      const ep = v.rec.ep === null ? "" : ` EP ${v.rec.ep}`;
+      glowText(ctx, `REC${ep}  ${mm}:${ss}`, W - 40, 44, { size: 28, color: C.red, align: "right", weight: 700 });
+      const tw = ctx.measureText(`REC${ep}  ${mm}:${ss}`).width;
+      ctx.fillStyle = C.red;
+      ctx.shadowColor = C.red;
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.arc(W - 40 - tw - 20, 44, 10, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // Row 2: neck pan tape (x = pan) + tilt ladder on the right
+    const x0 = 170, x1 = 820, yT = 178;
+    const n = v.neck;
+    const lineColor = n ? C.dim : C.faint;
+    glowPath(ctx, lineColor, 2, () => {
+      ctx.moveTo(x0, yT);
+      ctx.lineTo(x1, yT);
+    });
+    glowText(ctx, "PAN", 70, yT, { size: 22, color: n ? C.dim : C.faint });
+    if (!n) {
+      glowText(ctx, "NECK --", 512, yT - 32, { size: 24, color: C.grey, align: "center" });
+      return;
+    }
+    const [plo, phi] = n.pl;
+    const px = (deg) => x0 + ((deg - plo) / (phi - plo)) * (x1 - x0);
+    for (let d = Math.ceil(plo / 10) * 10; d <= phi; d += 10) {
+      const major = d % 30 === 0;
+      glowPath(ctx, major ? C.dim : C.faint, 2, () => {
+        ctx.moveTo(px(d), yT);
+        ctx.lineTo(px(d), yT + (major ? 18 : 10));
+      });
+      if (major) glowText(ctx, `${d}`, px(d), yT + 36, { size: 18, color: C.dim, align: "center", weight: 400 });
+    }
+    for (const lim of [plo, phi]) {
+      glowPath(ctx, C.amber, 3, () => {
+        ctx.moveTo(px(lim), yT - 18);
+        ctx.lineTo(px(lim), yT + 18);
+      });
+    }
+    const nearPan = Math.min(n.pan - plo, phi - n.pan) < 5;
+    const panX = px(Math.min(phi, Math.max(plo, n.pan)));
+    triangle(ctx, panX, yT - 4, 10, true, nearPan ? C.amber : C.cyan);
+    glowText(ctx, fmtDeg(n.pan), panX, yT - 40, { size: 26, color: nearPan ? C.amber : C.text, align: "center" });
+
+    const [tlo, thi] = n.tl;
+    const lx = 890, ly0 = 116, ly1 = 226;
+    const ty = (deg) => ly0 + ((deg - tlo) / (thi - tlo)) * (ly1 - ly0); // + tilt = down on this neck
+    glowPath(ctx, C.dim, 2, () => {
+      ctx.moveTo(lx, ly0);
+      ctx.lineTo(lx, ly1);
+    });
+    for (const lim of [tlo, thi]) {
+      glowPath(ctx, C.amber, 3, () => {
+        ctx.moveTo(lx - 12, ty(lim));
+        ctx.lineTo(lx + 12, ty(lim));
+      });
+    }
+    const nearTilt = Math.min(n.tilt - tlo, thi - n.tilt) < 5;
+    const tiltY = ty(Math.min(thi, Math.max(tlo, n.tilt)));
+    ctx.save();
+    ctx.translate(lx - 8, tiltY);
+    ctx.rotate(-Math.PI / 2);
+    triangle(ctx, 0, 0, 9, true, nearTilt ? C.amber : C.cyan);
+    ctx.restore();
+    glowText(ctx, "TILT", lx + 24, 136, { size: 22, color: C.dim });
+    glowText(ctx, fmtDeg(n.tilt), lx + 24, 176, { size: 26, color: nearTilt ? C.amber : C.text });
+  },
+});
+
+// --- left / right: arm status + gripper gauge, inside a bracket arc
+function makeArmPanel(side) {
+  const L = side === "left";
+  return makeHudPanel({
+    px: [320, 640], widthM: 0.24, offset: new THREE.Vector3(L ? -0.66 : 0.66, -0.02, -HUD_DIST),
+    yawDeg: L ? 20 : -20, // turned in toward the eyes
+    view: ({ s, r }) => ({
+      teleop: !!(s && s.enabled),
+      on: !!(s && s.arm_enabled && s.arm_enabled[side]),
+      lost: !!(s && (s.warnings || []).includes(`${side}_tracking_lost`)),
+      robot: !!r,
+      ik: r && r.ik_ok ? r.ik_ok[side] ?? null : null,
+      grip: r && r.gripper && r.gripper[side] != null ? Math.round(100 * clamp01(r.gripper[side])) : null,
+    }),
+    draw: (ctx, W, H, v) => {
+      const status = v.lost ? ["LOST", C.red] : v.on ? ["ACTIVE", C.green] : v.teleop ? ["HOLD", C.cyan] : ["OFF", C.grey];
+      const arcColor = v.lost ? C.red : v.on ? C.green : v.teleop ? C.dim : C.faint;
+      // bracket: arc of a big circle along the outer edge, in 3 segments
+      const R = 700, half = 290, cy = H / 2;
+      const cx = L ? 30 + R : W - 30 - R;
+      const span = Math.asin(half / R);
+      const mid = L ? Math.PI : 0;
+      const gaps = [[-1, -0.36], [-0.3, 0.3], [0.36, 1]];
+      for (const [a, b] of gaps) {
+        glowPath(ctx, arcColor, v.on ? 5 : 3, () => ctx.arc(cx, cy, R, mid + a * span, mid + b * span));
+      }
+      glowPath(ctx, C.faint, 2, () => ctx.arc(cx, cy, R - 16, mid - 0.9 * span, mid + 0.9 * span));
+
+      const tx = L ? 120 : W - 120;
+      const align = L ? "left" : "right";
+      glowText(ctx, `${L ? "L" : "R"} ARM`, tx, 72, { size: 34, color: C.text, align, weight: 700 });
+      glowText(ctx, status[0], tx, 122, { size: 28, color: status[1], align });
+      const ik = v.ik === null ? ["IK --", C.grey] : v.ik ? ["IK OK", C.dim] : ["IK LIMIT", C.amber];
+      glowText(ctx, ik[0], tx, 166, { size: 24, color: ik[1], align });
+
+      // gripper gauge: 270° ring, fill = % open
+      const gx = L ? 195 : W - 195, gy = 380, gr = 82;
+      const a0 = 0.75 * Math.PI, sweep = 1.5 * Math.PI;
+      glowPath(ctx, C.faint, 14, () => ctx.arc(gx, gy, gr, a0, a0 + sweep));
+      if (v.grip === null) {
+        glowText(ctx, "NO", gx, gy - 16, { size: 26, color: C.grey, align: "center" });
+        glowText(ctx, "GRIP", gx, gy + 16, { size: 26, color: C.grey, align: "center" });
+      } else {
+        const fill = v.grip / 100;
+        if (fill > 0.005) glowPath(ctx, v.on ? C.cyan : C.dim, 14, () => ctx.arc(gx, gy, gr, a0, a0 + fill * sweep));
+        for (let i = 0; i <= 10; i++) { // tick every 10 %
+          const a = a0 + (i / 10) * sweep;
+          glowPath(ctx, C.faint, 2, () => {
+            ctx.moveTo(gx + Math.cos(a) * (gr + 12), gy + Math.sin(a) * (gr + 12));
+            ctx.lineTo(gx + Math.cos(a) * (gr + 20), gy + Math.sin(a) * (gr + 20));
+          });
+        }
+        glowText(ctx, `${v.grip}%`, gx, gy - 8, { size: 38, color: C.text, align: "center", weight: 700 });
+        glowText(ctx, "OPEN", gx, gy + 28, { size: 20, color: C.dim, align: "center" });
+      }
+      glowText(ctx, "GRIPPER", gx, gy + gr + 50, { size: 22, color: v.grip === null ? C.faint : C.dim, align: "center" });
+    },
+  });
+}
+const leftArmPanel = makeArmPanel("left");
+const rightArmPanel = makeArmPanel("right");
+
+// --- bottom: lift height, base motion, task prompt while recording
+const bottomPanel = makeHudPanel({
+  px: [1024, 200], widthM: 0.8, offset: new THREE.Vector3(0, -0.4, -HUD_DIST),
+  view: ({ s, r }) => {
+    const lift = r && r.lift ? r.lift : null;
+    const base = s && String(s.state).includes("BASE") && r && r.base_vel ? r.base_vel : null;
+    const rec = s && s.recording && s.recording.active ? s.recording : null;
+    return {
+      lift: lift ? { h: Math.round(lift.height * 1000), min: lift.min, max: lift.max } : null,
+      liftDir: s && String(s.state).includes("LIFT UP") ? "up" : s && String(s.state).includes("LIFT DOWN") ? "down" : null,
+      base: base ? base.map((x) => Math.round(x * 100) / 100) : null,
+      task: rec && rec.task ? String(rec.task).slice(0, 70) : null,
+    };
+  },
+  draw: (ctx, W, H, v) => {
+    // lift: 20-segment bar
+    const bx = 60, by = 78, bw = 400, bh = 26, n = 20;
+    glowText(ctx, "LIFT", bx, 46, { size: 24, color: v.lift ? C.dim : C.faint });
+    if (v.liftDir) glowText(ctx, v.liftDir === "up" ? "▲ UP" : "▼ DOWN", bx + 90, 46, { size: 24, color: C.amber, weight: 700 });
+    const frac = v.lift ? clamp01((v.lift.h / 1000 - v.lift.min) / (v.lift.max - v.lift.min)) : 0;
+    for (let i = 0; i < n; i++) {
+      const lit = v.lift && (i + 0.5) / n <= frac;
+      ctx.fillStyle = lit ? C.cyan : C.faint;
+      ctx.shadowColor = C.cyan;
+      ctx.shadowBlur = lit ? 8 : 0;
+      ctx.fillRect(bx + (i * bw) / n + 2, by, bw / n - 4, bh);
+    }
+    ctx.shadowBlur = 0;
+    glowText(ctx, v.lift ? `${(v.lift.h / 1000).toFixed(3)} M` : "--", bx, 136, { size: 26, color: v.lift ? C.text : C.grey });
+
+    // base: direction dial (robot x forward = up, y left = left) + numbers
+    const dx = 690, dy = 92, dr = 52;
+    glowPath(ctx, v.base ? C.dim : C.faint, 2, () => ctx.arc(dx, dy, dr, 0, 2 * Math.PI));
+    glowText(ctx, "BASE", W - 60, 46, { size: 24, color: v.base ? C.amber : C.faint, align: "right" });
+    if (!v.base) {
+      glowText(ctx, "PARKED", W - 60, 92, { size: 26, color: C.grey, align: "right" });
+    } else {
+      const [vx, vy, wz] = v.base;
+      const speed = Math.hypot(vx, vy);
+      if (speed > 0.005) {
+        const k = Math.min(1, speed / 0.3) * (dr - 6) / speed;
+        glowPath(ctx, C.amber, 5, () => {
+          ctx.moveTo(dx, dy);
+          ctx.lineTo(dx - vy * k, dy - vx * k);
+        });
+      }
+      if (Math.abs(wz) > 0.01) { // turn: arc along the dial, counter-clockwise = left
+        const a = Math.min(Math.PI, Math.abs(wz) * 1.5);
+        glowPath(ctx, C.amber, 4, () => ctx.arc(dx, dy, dr + 10, -Math.PI / 2, -Math.PI / 2 - Math.sign(wz) * a, wz > 0));
+      }
+      glowText(ctx, `${speed.toFixed(2)} M/S`, W - 60, 92, { size: 26, color: C.text, align: "right" });
+      glowText(ctx, `${sgn(wz)}${Math.abs(wz).toFixed(2)} RAD/S`, W - 60, 128, { size: 22, color: C.dim, align: "right" });
+    }
+
+    if (v.task) {
+      scrim(ctx, 40, 160, W - 80, 36, 10);
+      glowText(ctx, `TASK  ${v.task.toUpperCase()}`, W / 2, 178, { size: 20, color: C.text, align: "center", weight: 400 });
+    }
+  },
+});
+
+// --- alert banner: top two alerts, pulses while any is red
+const alertPanel = makeHudPanel({
+  px: [1024, 96], widthM: 0.72, offset: new THREE.Vector3(0, 0.24, -HUD_DIST),
+  view: ({ alerts }) => ({ alerts: alerts.slice(0, 2) }),
+  draw: (ctx, W, H, v) => {
+    if (!v.alerts.length) return;
+    const color = v.alerts.some((a) => a[1] === "red") ? C.red : C.amber;
+    scrim(ctx, 8, 8, W - 16, H - 16, 18);
+    glowPath(ctx, color, 3, () => chamfer(ctx, 8, 8, W - 16, H - 16, 18));
+    glowText(ctx, `⚠ ${v.alerts.map((a) => a[0]).join("  ·  ")}`, W / 2, H / 2, { size: 28, color, align: "center", weight: 700 });
+  },
+});
+
+let lastHudUpdate = -Infinity;
+function refreshHud() {
+  lastHudUpdate = -Infinity; // redraw on the next frame
+}
+
+function updateHud(now) {
+  if (now - lastHudUpdate < 1000 / HUD_RATE_HZ) return;
+  lastHudUpdate = now;
+  const model = hudModel();
+  for (const p of hudPanels) {
+    const v = p.view(model);
+    const key = JSON.stringify(v);
+    if (key === p.key) continue;
+    p.key = key;
+    p.ctx.clearRect(0, 0, p.canvas.width, p.canvas.height);
+    p.draw(p.ctx, p.canvas.width, p.canvas.height, v);
+    p.texture.needsUpdate = true;
+  }
+  alertPanel.mesh.visible = model.alerts.length > 0;
+  alertPanel.red = model.alerts.some((a) => a[1] === "red");
+}
+
+function placeHud(headPos, headQuat, now) {
+  updateHud(now);
+  alertPanel.mesh.material.opacity = alertPanel.red ? 0.6 + 0.4 * Math.abs(Math.sin(now * 0.005)) : 1;
+  for (const p of hudPanels) {
+    headLock(p.mesh, p.offset, headPos, headQuat);
+    p.mesh.quaternion.multiply(p.turn);
+  }
+}
 
 let lastTeleopState = null;
 
@@ -473,25 +884,6 @@ function handleTeleopState(msg) {
   }
 
   lastTeleopState = msg;
-  refreshHud();
-}
-
-function refreshHud() {
-  const msg = lastTeleopState;
-  let text = "STATE: --";
-  let color = "#aaaaaa";
-  if (msg) {
-    const l = msg.arm_enabled.left ? "ON" : "off";
-    const r = msg.arm_enabled.right ? "ON" : "off";
-    color = msg.warnings && msg.warnings.length ? "#ff5555" : "#eeeeee";
-    text = `${msg.state}  L:${l}  R:${r}`;
-  }
-  if (!videoOk()) text += "  NO VIDEO";
-  if (performance.now() < ipdShownUntil && ipdMm !== null) {
-    text = `IPD ${ipdMm.toFixed(1)} mm`;
-    color = "#66ccff";
-  }
-  drawHud(text, color);
 }
 
 // ---------- Pose extraction + send loop ----------
@@ -536,6 +928,11 @@ renderer.setAnimationLoop((timestamp, frame) => {
         const a = viewerPose.views[0].transform.position;
         const b = viewerPose.views[1].transform.position;
         const mm = 1000 * Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        // Vertical frustum centre, averaged over both eyes. Column-major
+        // projection: m[9] / m[5] = (top + bottom) / (2 * near).
+        let tanY = 0;
+        for (const v of viewerPose.views) tanY += v.projectionMatrix[9] / v.projectionMatrix[5];
+        viewCenterTanY = tanY / viewerPose.views.length;
         if (mm > 30 && mm < 100) {
           measuredIpdMm = mm;
           if (ipdMm === null) setIpd(mm, false); // first run on this headset: start at its IPD
@@ -547,7 +944,7 @@ renderer.setAnimationLoop((timestamp, frame) => {
       headLock(headScreen, HEAD_SCREEN_OFFSET, tmpPos, tmpQuat);
       headLock(leftGripperScreen, LEFT_GRIPPER_OFFSET, tmpPos, tmpQuat);
       headLock(rightGripperScreen, RIGHT_GRIPPER_OFFSET, tmpPos, tmpQuat);
-      headLock(hudMesh, HUD_OFFSET, tmpPos, tmpQuat);
+      placeHud(tmpPos, tmpQuat, timestamp);
     }
 
     let leftPayload = null;
@@ -568,5 +965,12 @@ renderer.setAnimationLoop((timestamp, frame) => {
     sendPose({ t: Date.now(), head: headPayload, left: leftPayload, right: rightPayload });
   }
 
+  if (!frame) {
+    // Not in VR (desktop preview): lock the screens + HUD to the page camera.
+    headLock(headScreen, HEAD_SCREEN_OFFSET, camera.position, camera.quaternion);
+    headLock(leftGripperScreen, LEFT_GRIPPER_OFFSET, camera.position, camera.quaternion);
+    headLock(rightGripperScreen, RIGHT_GRIPPER_OFFSET, camera.position, camera.quaternion);
+    placeHud(camera.position, camera.quaternion, timestamp);
+  }
   renderer.render(scene, camera);
 });
