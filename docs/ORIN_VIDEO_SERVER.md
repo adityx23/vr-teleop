@@ -80,9 +80,15 @@ halves should look nearly identical except for a small horizontal shift.
 
 - Head camera: ZED 2i (S/N 30496273), ZED SDK 5.2.3 on the Orin, on the 2-DOF
   neck, which rides on the lift.
-- Wrist cameras: one per arm, **not plugged into the Orin yet** (only the ZED
-  shows up in `/dev/v4l`), so both gripper streams are stubs in
-  `camera_config.orin.json`. **The left gripper is removed.** Ask the user
+- Right wrist camera: **OAK-D-SR** (Luxonis, two OV9782 color cameras
+  `CAM_B`/`CAM_C`, no `CAM_A`; USB port 1.1.2.4, USB 2). Not a UVC device, so
+  it uses the `oak` source (depthai v3) as `gripper_right`, `CAM_C`, 640x400.
+  depthai 3.11.0 is the `~/.local` install, symlinked into the `vr_teleop`
+  env (`depthai.cpython-310-*.so` + `depthai.libs`); `~/depthai-core` is the
+  matching source/examples. Its first boot takes ~5 s (the source raises
+  `DEPTHAI_BOOTUP_TIMEOUT`), and `pipeline.stop()` takes ~3 s on shutdown.
+  Both OAK cameras together only manage ~21 fps over USB 2; one does 30.
+- Left wrist camera: none (stub). **The left gripper is removed.** Ask the user
   whether a left wrist camera is still mounted; if not, leave `gripper_left`
   as a stub.
 - There is also a fisheye camera. It is **not** part of the headset streams
@@ -94,7 +100,8 @@ halves should look nearly identical except for a small horizontal shift.
 cd ~/yor_ws/vr-teleop && ./start_video.sh   # Ctrl-C to stop
 ```
 Uses `camera_config.orin.json` (`head` stub, `head_stereo` ZED side by side
-960x540 per eye, 30 fps, ~82 KB/frame; grippers stub) and the `vr_teleop`
+960x540 per eye, 30 fps, ~82-94 KB/frame; `gripper_right` OAK-D-SR 640x400
+30 fps; `gripper_left` stub) and the `vr_teleop`
 micromamba env (Python 3.10 + requirements + pyzed 5.2, `PYTHONNOUSERSITE=1`
 because `~/.local` has a NumPy 2 that breaks the system OpenCV). Open headset
 pages pick the stream up within ~2 s. Approach 1 below: the video server

@@ -12,6 +12,7 @@ camera_config.example.json and docs/ORIN_VIDEO_SERVER.md):
   {"type": "stub"}                                      placeholder "NO SIGNAL" frames
   {"type": "opencv", "device": "/dev/video0" | 0}       V4L2 webcam / USB camera
   {"type": "zed", "serial": null, "view": "left"}       ZED via pyzed (opens the camera itself)
+  {"type": "oak", "socket": "CAM_C"}                    Luxonis OAK color camera via depthai
   {"type": "zed", "view": "side_by_side"}               ZED stereo: rectified left|right in one
                                                         frame, for the "head_stereo" stream
 Common options: "width", "height", "fps", "jpeg_quality". For side_by_side,
@@ -31,6 +32,7 @@ import logging
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import cv2
@@ -160,7 +162,76 @@ class ZedSource:
         self.cam.close()
 
 
-SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource}
+class OakSource:
+    """Luxonis OAK camera via depthai v3 (not a UVC device, so "opencv" can't
+    open it). Streams one color camera. Options:
+      "socket": "CAM_A" | "CAM_B" | "CAM_C" (default: first color camera;
+                the OAK-D-SR has only CAM_B / CAM_C)
+      "device": device id (mxid), if more than one OAK is attached
+      "usb":    "high" (USB 2, default -- most reliable behind hubs) | "super"
+    width/height are the output size; keep the sensor's aspect ratio (e.g.
+    640x400 for the SR's 1280x800) or the image is cropped."""
+
+    def __init__(self, opts):
+        import os
+
+        # First boot uploads firmware and re-enumerates on USB, which can take
+        # longer than depthai's default timeout (seen: ~4.7 s behind a hub).
+        os.environ.setdefault("DEPTHAI_BOOTUP_TIMEOUT", "20000")
+        import depthai as dai
+
+        speed = dai.UsbSpeed.SUPER if opts.get("usb") == "super" else dai.UsbSpeed.HIGH
+        if opts.get("device"):
+            self.device = dai.Device(dai.DeviceInfo(str(opts["device"])), speed)
+        else:
+            self.device = dai.Device(speed)
+        try:
+            color = [f.socket for f in self.device.getConnectedCameraFeatures()
+                     if dai.CameraSensorType.COLOR in f.supportedTypes]
+            if opts.get("socket"):
+                socket = getattr(dai.CameraBoardSocket, opts["socket"])
+            elif color:
+                socket = color[0]
+            else:
+                raise RuntimeError("no color camera on this OAK")
+            self.pipeline = dai.Pipeline(self.device)
+            cam = self.pipeline.create(dai.node.Camera).build(socket)
+            out = cam.requestOutput((int(opts["width"]), int(opts["height"])),
+                                    type=dai.ImgFrame.Type.BGR888i, fps=float(opts["fps"]))
+            self.queue = out.createOutputQueue(maxSize=1, blocking=False)  # newest frame only
+            self.pipeline.start()
+        except Exception:
+            self.device.close()
+            raise
+        self.rotate = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                       270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(int(opts.get("rotate", 0)))
+        self.desc = f"oak:{self.device.getDeviceName()}:{socket.name}"
+        self._failed = False
+
+    def read(self):
+        try:
+            # Bounded wait: a thread blocked inside depthai at shutdown aborts the
+            # whole process, so return regularly and let _run see the stop flag.
+            msg = self.queue.get(timeout=timedelta(milliseconds=200))
+            if msg is None:
+                return None
+            frame = msg.getCvFrame()
+        except Exception as e:  # noqa: BLE001 -- device unplugged / crashed / queue closed
+            if not self._failed:
+                log.error("%s read failed: %s", self.desc, e)
+                self._failed = True
+            time.sleep(0.5)
+            return None
+        return cv2.rotate(frame, self.rotate) if self.rotate is not None else frame
+
+    def close(self):
+        try:
+            self.pipeline.stop()
+        finally:
+            self.device.close()
+
+
+SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource, "oak": OakSource}
 
 
 # ----------------------------------------------------------------- streamer
@@ -206,8 +277,12 @@ class MultiCameraStreamer:
 
     def stop(self):
         self._stop.set()
+        # Shared deadline: sources close in parallel, and some are slow to
+        # release (an OAK's pipeline.stop() takes ~3 s). Exiting while a thread
+        # is still inside the camera SDK aborts the process.
+        deadline = time.time() + 8.0
         for t in self._threads:
-            t.join(timeout=2)
+            t.join(timeout=max(0.0, deadline - time.time()))
 
     # ------------------------------------------------------------- workers
     def _run(self, name, opts):

@@ -28,7 +28,7 @@ Quest headset (WebXR page, served by the Pi)
 - `server/server.py` — HTTPS + WebSocket server (`run()`), `/health`,
   `/config.json`, `--video-only` mode for the Orin.
 - `server/cameras.py` — `MultiCameraStreamer`: camera sources from a JSON
-  config (`stub` / `opencv` / `zed`), multiplexed over one WebSocket as
+  config (`stub` / `opencv` / `zed` / `oak`), multiplexed over one WebSocket as
   `[1 stream-id byte] + [JPEG bytes]`. Streams: `0 head` (mono), `1
   gripper_left`, `2 gripper_right`, `3 head_stereo` (rectified left|right
   side by side, plus a `stereo_info` JSON calibration message).
@@ -105,8 +105,12 @@ Allow `python.exe` through Windows Defender Firewall (or
   per eye, ~82 KB/frame, ~20 Mbit/s at 30 fps); watch `/health`
   `frames_dropped` and drop to VGA (672x376 per eye) if Wi-Fi can't keep up.
   WebRTC/H.264 on the Orin's hardware encoder is the eventual fix.
-- Wrist cameras are stubs until connected (left gripper is removed). The
-  fisheye isn't streamed (would need a 4th screen in `main.js`).
+- Right wrist camera: OAK-D-SR (`oak` source, its right color camera
+  `CAM_C`, 640x400, 30 fps, ~34 KB/frame). Left wrist is a stub (left
+  gripper removed). The fisheye isn't streamed (would need a 4th screen in
+  `main.js`).
+- Total video is now ~31 Mbit/s (stereo ~94 KB + OAK ~34 KB per frame at
+  30 fps); watch `frames_dropped`.
 - The ZED's 120 mm baseline is ~2x human eye spacing, so depth looks
   exaggerated.
 - No auth on either server — fine on the robot LAN, nothing else.
