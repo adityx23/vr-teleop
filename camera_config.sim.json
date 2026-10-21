@@ -1,0 +1,4 @@
+{
+  "head": {"type": "none"},
+  "head_stereo": {"type": "zmq", "address": "tcp://127.0.0.1:5560", "fps": 30}
+}

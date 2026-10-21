@@ -14,6 +14,8 @@ camera_config.example.json and docs/ORIN_VIDEO_SERVER.md):
   {"type": "zed", "serial": null, "view": "left"}       ZED via pyzed (opens the camera itself)
   {"type": "zed", "view": "side_by_side"}               ZED stereo: rectified left|right in one
                                                         frame, for the "head_stereo" stream
+  {"type": "zmq", "address": "tcp://127.0.0.1:5560"}    JPEGs another process publishes (e.g. the
+                                                        YOR MuJoCo sim), passed through as is
 Common options: "width", "height", "fps", "jpeg_quality". For side_by_side,
 width/height are per eye (the frame is 2*width wide).
 A source that fails to open falls back to stub frames, labelled with the reason.
@@ -161,7 +163,43 @@ class ZedSource:
         self.cam.close()
 
 
-SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource}
+class ZmqSource:
+    """Frames that another process owns and publishes (ZMQ PUB): each message is
+    [topic, jpeg] or [topic, jpeg, stereo_info json]. The JPEG is streamed as is.
+    Waits up to "timeout_s" for the first frame so stereo_info is known at open.
+    Publisher: YOR robot/yor_mujoco.py (StereoPublisher)."""
+
+    def __init__(self, opts):
+        import zmq
+
+        self.zmq = zmq
+        self.sock = zmq.Context.instance().socket(zmq.SUB)
+        self.sock.setsockopt(zmq.RCVHWM, 2)
+        self.sock.connect(opts["address"])
+        self.sock.setsockopt(zmq.SUBSCRIBE, opts.get("topic", "").encode())
+        self.desc = f"zmq:{opts['address']}"
+        self.stereo_info = None
+        if not self.sock.poll(int(1000 * float(opts.get("timeout_s", 10.0)))):
+            self.sock.close(linger=0)
+            raise RuntimeError(f"no frames from {opts['address']} (is the publisher running?)")
+        self._pending = self.sock.recv_multipart()
+        if len(self._pending) > 2:
+            self.stereo_info = {**json.loads(self._pending[2]), "stream": STREAM_IDS["head_stereo"]}
+
+    def read(self):
+        """Newest JPEG bytes (older queued frames are dropped), or None after 100 ms."""
+        msg, self._pending = self._pending, None
+        if msg is None and self.sock.poll(100):
+            msg = self.sock.recv_multipart()
+        while msg is not None and self.sock.poll(0):
+            msg = self.sock.recv_multipart()
+        return None if msg is None else bytes(msg[1])
+
+    def close(self):
+        self.sock.close(linger=0)
+
+
+SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource, "zmq": ZmqSource}
 
 
 # ----------------------------------------------------------------- streamer
@@ -243,7 +281,7 @@ class MultiCameraStreamer:
                 if frame is None:
                     time.sleep(0.01)
                     continue
-                data = _encode(frame, opts["jpeg_quality"])
+                data = frame if isinstance(frame, bytes) else _encode(frame, opts["jpeg_quality"])  # bytes: already JPEG
                 if data:
                     self._broadcast(STREAM_IDS[name], data)
                     self.stats[name]["frames"] += 1

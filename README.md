@@ -132,6 +132,20 @@ device-to-device traffic by default even on the same subnet.
    try the button combos above and confirm the state machine responds as
    expected.
 
+## Simulator (YOR MuJoCo)
+The YOR repo's `robot/yor_mujoco.py` serves the same RPC calls as `yor.py`
+(`docs/YOR_RPC_INTERFACE.md`), so `server/yor_bridge.py` drives the sim
+unchanged. The sim publishes its head ZED view over local ZMQ; the video
+server streams it with the `"zmq"` camera source:
+
+```bash
+python server/server.py --video-only --port 8444 --camera-config camera_config.sim.json
+python server/yor_bridge.py --rpc-host localhost --video <this-pc-ip>:8444
+```
+
+From the YOR repo, `python robot/sim_vr_teleop.py` starts the sim and both of
+these in one command; setup and controls are in YOR's `docs/SIM_VR_TELEOP.md`.
+
 ## Known limitations / next steps
 - Camera streams are JPEG-over-WebSocket (head cam ~20fps, gripper stubs
   ~2fps, 640x480) — fine for validating the pipeline, but swap for a proper

@@ -97,6 +97,9 @@ repo's `robot/whole_body_teleop.py` is a thin launcher for it (Orin video
 address + neck calibration file). The exact RPC calls, frames and units are in
 `docs/YOR_RPC_INTERFACE.md` -- a simulator that serves those calls can run the
 unchanged bridge (`python server/yor_bridge.py --rpc-host localhost`).
+YOR's `robot/yor_mujoco.py` is that simulator; it publishes its ZED view over
+ZMQ, which the video server streams via the `"zmq"` source in `cameras.py`
+(`camera_config.sim.json`). YOR's `robot/sim_vr_teleop.py` runs all three.
 
 ## Two-machine setup (current)
 The robot Pi serves the page and runs control (no video); the Orin runs
