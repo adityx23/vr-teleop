@@ -1,6 +1,6 @@
 {
   "head": {"type": "stub"},
   "head_stereo": {"type": "commlink", "host": "127.0.0.1", "port": 5551, "topic": "zed/view", "key": "stereo_jpeg", "fps": 30},
-  "gripper_left": {"type": "oak", "device": "18443010D1B3121300", "socket": "CAM_C", "width": 640, "height": 400, "fps": 30, "jpeg_quality": 70},
-  "gripper_right": {"type": "oak", "device": "194430103195095A00", "socket": "CAM_C", "width": 640, "height": 400, "fps": 30, "jpeg_quality": 70}
+  "gripper_left": {"type": "none"},
+  "gripper_right": {"type": "none"}
 }

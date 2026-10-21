@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the Orin video server for the VR headset (ZED stereo on stream 3, OAK-D-SR right wrist cam).
+# Start the Orin video server for the VR headset: ZED stereo only (stream 3, from zed_rgbd.py); the OAK wrist cams are not streamed.
 #   ./start_video.sh                 uses camera_config.orin.json
 #   ./start_video.sh my_cams.json    uses another camera config
 # Ctrl-C to stop. The headset page reconnects by itself whenever this restarts.
