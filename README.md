@@ -105,12 +105,12 @@ Allow `python.exe` through Windows Defender Firewall (or
   per eye, ~82 KB/frame, ~20 Mbit/s at 30 fps); watch `/health`
   `frames_dropped` and drop to VGA (672x376 per eye) if Wi-Fi can't keep up.
   WebRTC/H.264 on the Orin's hardware encoder is the eventual fix.
-- Right wrist camera: OAK-D-SR (`oak` source, its right color camera
-  `CAM_C`, 640x400, 30 fps, ~34 KB/frame). Left wrist is a stub (left
-  gripper removed). The fisheye isn't streamed (would need a 4th screen in
-  `main.js`).
-- Total video is now ~31 Mbit/s (stereo ~94 KB + OAK ~34 KB per frame at
-  30 fps); watch `frames_dropped`.
+- Wrist cameras: one OAK-D-SR per gripper (`oak` source, picked by device
+  id: left `18443010D1B3121300`, right `194430103195095A00`; each streams
+  its `CAM_C` color camera, 640x400, 30 fps, ~22-34 KB/frame). The fisheye
+  isn't streamed (would need a 4th screen in `main.js`).
+- Total video is now ~36 Mbit/s (stereo ~92 KB + two OAKs ~22-34 KB per
+  frame at 30 fps); watch `frames_dropped`.
 - The ZED's 120 mm baseline is ~2x human eye spacing, so depth looks
   exaggerated.
 - No auth on either server — fine on the robot LAN, nothing else.

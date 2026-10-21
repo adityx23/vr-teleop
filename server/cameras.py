@@ -162,6 +162,12 @@ class ZedSource:
         self.cam.close()
 
 
+# depthai boots each OAK by uploading firmware, after which it re-enumerates
+# on USB. Two OAKs booting at once from one process steal each other's
+# connection ("X_LINK_DEVICE_ALREADY_IN_USE"), so open them one at a time.
+_OAK_OPEN_LOCK = threading.Lock()
+
+
 class OakSource:
     """Luxonis OAK camera via depthai v3 (not a UVC device, so "opencv" can't
     open it). Streams one color camera. Options:
@@ -180,6 +186,10 @@ class OakSource:
         os.environ.setdefault("DEPTHAI_BOOTUP_TIMEOUT", "20000")
         import depthai as dai
 
+        with _OAK_OPEN_LOCK:
+            self._open(dai, opts)
+
+    def _open(self, dai, opts):
         speed = dai.UsbSpeed.SUPER if opts.get("usb") == "super" else dai.UsbSpeed.HIGH
         if opts.get("device"):
             self.device = dai.Device(dai.DeviceInfo(str(opts["device"])), speed)
@@ -205,7 +215,7 @@ class OakSource:
             raise
         self.rotate = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
                        270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(int(opts.get("rotate", 0)))
-        self.desc = f"oak:{self.device.getDeviceName()}:{socket.name}"
+        self.desc = f"oak:{self.device.getDeviceName()}:{self.device.getDeviceId()}:{socket.name}"
         self._failed = False
 
     def read(self):
