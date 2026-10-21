@@ -100,13 +100,22 @@ halves should look nearly identical except for a small horizontal shift.
 ```bash
 cd ~/yor_ws/vr-teleop && ./start_video.sh   # Ctrl-C to stop
 ```
-Uses `camera_config.orin.json` (`head` stub, `head_stereo` ZED side by side
-960x540 per eye, 30 fps, ~82-94 KB/frame; `gripper_right` OAK-D-SR 640x400
-30 fps; `gripper_left` the other OAK-D-SR) and the `vr_teleop`
-micromamba env (Python 3.10 + requirements + pyzed 5.2, `PYTHONNOUSERSITE=1`
-because `~/.local` has a NumPy 2 that breaks the system OpenCV). Open headset
-pages pick the stream up within ~2 s. Approach 1 below: the video server
-opens the ZED itself, so stop anything else holding it first.
+Needs `python3 ~/yor_ws/zed_rgbd.py --publish --stereo` running too (any
+order): it owns the ZED and publishes `zed/view` on 127.0.0.1:5551 (left
+color JPEG + stereo [left|right] JPEG + `stereo_info`, no depth). This is
+approach 2 below. `camera_config.orin.json`: `head` stub (duplicate of the
+stereo left eye, ~30 Mbit/s saved), `head_stereo` = `commlink` source
+forwarding `stereo_jpeg` byte for byte (calibration relayed from the packets),
+`gripper_left`/`gripper_right` = the two OAK-D-SRs (opened by the video
+server). The `commlink`, `pyzmq` and `lz4` packages are symlinked into the
+`vr_teleop` env from `~/.local` / system dist-packages, like depthai.
+
+Watchdog (cameras.py): an open source with no frame for 3 s (`STALL_S`) is
+closed and reopened (`stalls` in `/health`); a failed open streams stub
+frames and retries after 2 s, then every 5 s (`RETRY_S`). `/health` fps
+updates every second, so a stalled stream reads 0. Measured 2026-10-21: ZED
+stereo ~15-17 fps (the rate `zed_rgbd.py` delivers, ~350-400 KB/frame), OAKs
+30 fps each.
 
 ## Most important constraint: the ZED can only be opened by one process
 

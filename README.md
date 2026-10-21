@@ -63,13 +63,20 @@ Constants (scales, speed limits, neck signs/offsets, lift) are in
 
 ## Running
 
-**Orin** (cameras; ZED must not be open in another process, e.g.
-`collect.py` / `deploy_observer.py` / the recorder):
+**Orin** (cameras), two terminals:
 ```bash
-cd ~/yor_ws/vr-teleop && ./start_video.sh
+cd ~/yor_ws && python3 zed_rgbd.py --publish --stereo   # owns the ZED; publishes zed/view on :5551
+cd ~/yor_ws/vr-teleop && ./start_video.sh                # video server, port 8444
 ```
-Uses the `vr_teleop` micromamba env (system Python on the Orin has a broken
-OpenCV/NumPy combo). Check with `curl -sk https://localhost:8444/health`.
+The video server doesn't open the ZED: `head_stereo` forwards the stereo JPEG
+`zed_rgbd.py` publishes (3840x1080, both eyes 1920x1080) byte for byte, so
+the ZED can also record/feed depth at the same time. The mono `head` stream
+is a stub (the headset hides it while stereo arrives). The two OAK-D-SR
+wrist cams are opened by the video server. Start order doesn't matter.
+Uses the `vr_teleop` micromamba env. Check with
+`curl -sk https://localhost:8444/health`: per stream `fps` (0 when stalled),
+`frames`, `error`, `stalls`. A camera that stops delivering for 3 s is
+reopened automatically; one that fails to open retries every few seconds.
 
 **Pi**: run `robot/whole_body_teleop.py` (YOR repo).
 

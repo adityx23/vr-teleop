@@ -13,6 +13,9 @@ camera_config.example.json and docs/ORIN_VIDEO_SERVER.md):
   {"type": "opencv", "device": "/dev/video0" | 0}       V4L2 webcam / USB camera
   {"type": "zed", "serial": null, "view": "left"}       ZED via pyzed (opens the camera itself)
   {"type": "oak", "socket": "CAM_C"}                    Luxonis OAK color camera via depthai
+  {"type": "commlink", "port": 5551, "topic": "zed/rgbd"} JPEGs another process publishes (e.g.
+                                                        ~/yor_ws/zed_rgbd.py --publish), forwarded as is;
+                                                        "key": "stereo_jpeg" (needs --stereo) for head_stereo
   {"type": "zed", "view": "side_by_side"}               ZED stereo: rectified left|right in one
                                                         frame, for the "head_stereo" stream
 Common options: "width", "height", "fps", "jpeg_quality". For side_by_side,
@@ -44,6 +47,9 @@ STREAM_IDS = {"head": 0, "gripper_left": 1, "gripper_right": 2, "head_stereo": 3
 
 DEFAULTS = {"width": 640, "height": 480, "fps": 20, "jpeg_quality": 70}
 STUB_FPS = 2  # placeholder frames are static, no need to push them fast
+STALL_S = 3.0  # an open source with no frame this long is closed and reopened
+RETRY_S = (2, 5)  # wait between failed (re)open attempts; the last value repeats (short, so a
+#                  camera or zed_rgbd.py that comes back shows up within seconds)
 
 # Used when no config file is given: head = first V4L2/DirectShow camera, grippers stubbed.
 DEFAULT_CONFIG = {
@@ -241,7 +247,67 @@ class OakSource:
             self.device.close()
 
 
-SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource, "oak": OakSource}
+class CommlinkJpegSource:
+    """Forwards JPEGs another process already publishes over commlink, byte for
+    byte (no decode/re-encode, so the headset gets exactly that stream).
+    Default: ~/yor_ws/zed_rgbd.py --publish, which owns the ZED and publishes
+    {"color_jpeg": <left lens JPEG>, "depth_mm", ...} on topic "zed/rgbd" at
+    127.0.0.1:5551. Use this instead of a "zed" source whenever that script is
+    running -- only one process can open the ZED. Options: "host", "port",
+    "topic", "key" (the packet field holding the JPEG). width/height/
+    jpeg_quality don't apply: frames are sent as published."""
+
+    STALE_S = 2.0  # no frame this long -> re-subscribe (the publisher may have restarted)
+
+    def __init__(self, opts):
+        from commlink import Subscriber
+
+        self._Subscriber = Subscriber
+        self.host = opts.get("host", "127.0.0.1")
+        self.port = int(opts.get("port", 5551))
+        self.topic = opts.get("topic", "zed/rgbd")
+        self.key = opts.get("key", "color_jpeg")
+        self.desc = f"commlink:{self.host}:{self.port}/{self.topic}:{self.key}"
+        self.stereo_info = None  # filled from the packets when key == "stereo_jpeg"
+        self._sub = None
+        self._subscribe()
+
+    def _subscribe(self):
+        if self._sub is not None:
+            self._sub.stop()
+        # Push mode: a background thread receives every frame; queue_size=1 keeps
+        # only the newest, so a slow reader never builds up lag. The SUB request
+        # is queued until the publisher is up, so start order doesn't matter.
+        self._sub = self._Subscriber(self.host, port=self.port, topics=[self.topic], buffer=True, queue_size=1)
+        self._last_frame = time.time()
+
+    def read(self):
+        sub = self._sub
+        # commlink's get() blocks with no timeout, which would keep this thread
+        # from ever seeing the stop flag; wait on its condition with a timeout.
+        with sub._cv:
+            if not sub._cv.wait_for(lambda: sub._queues.get(self.topic), timeout=0.2):
+                pkt = None
+            else:
+                pkt = sub._queues[self.topic].popleft()
+        if pkt is None:
+            if time.time() - self._last_frame > self.STALE_S:
+                self._subscribe()
+            return None
+        self._last_frame = time.time()
+        data = pkt.get(self.key) if isinstance(pkt, dict) else None
+        # zed_rgbd.py --stereo ships the per-eye calibration with each stereo frame;
+        # the streamer picks up stereo_info after read() and re-broadcasts it on change.
+        info = pkt.get("stereo_info") if isinstance(pkt, dict) and self.key == "stereo_jpeg" else None
+        if info:
+            self.stereo_info = {"type": "stereo_info", "stream": STREAM_IDS["head_stereo"], **info}
+        return bytes(data) if data else None
+
+    def close(self):
+        self._sub.stop()
+
+
+SOURCE_TYPES = {"opencv": OpenCVSource, "zed": ZedSource, "oak": OakSource, "commlink": CommlinkJpegSource}
 
 
 # ----------------------------------------------------------------- streamer
@@ -255,7 +321,7 @@ class MultiCameraStreamer:
         self._clients_lock = threading.Lock()
         self._stop = threading.Event()
         self.config = config or dict(DEFAULT_CONFIG)
-        self.stats = {name: {"source": None, "frames": 0, "fps": 0.0, "error": None} for name in STREAM_IDS}
+        self.stats = {name: {"source": None, "frames": 0, "fps": 0.0, "error": None, "stalls": 0} for name in STREAM_IDS}
         self.stats_dropped = 0
         self._pending = {}  # (id(ws), stream_id) -> future of the in-flight send
         self.stereo_info = None  # set once a head_stereo source opens
@@ -296,55 +362,106 @@ class MultiCameraStreamer:
 
     # ------------------------------------------------------------- workers
     def _run(self, name, opts):
+        """Open the source and stream it. Watchdog: a source that stops delivering
+        frames for STALL_S is closed and reopened; a source that fails to open (or
+        reopens but still delivers nothing) streams stub frames between retries
+        with backoff, so a camera that was busy or unplugged comes back by itself."""
         kind = opts.get("type", "stub")
+        st = self.stats[name]
         if kind == "none":
-            self.stats[name]["source"] = "none"
+            st["source"] = "none"
             return
         if kind == "stub":
             self._run_stub(name, opts, f"{name} (stub)")
             return
-        try:
-            source = SOURCE_TYPES[kind](opts)
-        except Exception as e:  # noqa: BLE001 -- any failure -> visible stub, keep other streams alive
-            log.error("%s: %s source failed (%s) -- streaming stub frames", name, kind, e)
-            self.stats[name]["error"] = str(e)
-            self._run_stub(name, opts, f"{name}: {kind} failed")
-            return
+        failures = 0
+        while not self._stop.is_set():
+            try:
+                source = SOURCE_TYPES[kind](opts)
+            except Exception as e:  # noqa: BLE001 -- any failure -> visible stub, keep other streams alive
+                delay = RETRY_S[min(failures, len(RETRY_S) - 1)]
+                failures += 1
+                log.error("%s: %s source failed (%s) -- stub frames, retrying in %s s", name, kind, e, delay)
+                st["error"] = str(e)
+                st["source"] = "stub"
+                self._run_stub(name, opts, f"{name}: {kind} failed", duration=delay)
+                continue
+            st["source"] = source.desc
+            st["error"] = None
+            log.info("%s: %s opened, target %s fps", name, source.desc, opts["fps"])
+            produced = self._stream(name, opts, source)
+            if self._stop.is_set():
+                break
+            # Stalled: no frame for STALL_S.
+            st["stalls"] += 1
+            st["error"] = f"no frames for {STALL_S:.0f} s (stall #{st['stalls']}), reopening"
+            log.warning("%s: %s", name, st["error"])
+            if produced:
+                failures = 0  # it was working: reopen right away
+            else:
+                delay = RETRY_S[min(failures, len(RETRY_S) - 1)]
+                failures += 1
+                self._run_stub(name, opts, f"{name}: no frames", duration=delay)
 
-        self.stats[name]["source"] = source.desc
-        log.info("%s: %s opened, target %s fps", name, source.desc, opts["fps"])
+    def _stream(self, name, opts, source):
+        """Broadcast frames until stopped or stalled; returns frames produced."""
+        st = self.stats[name]
         info = getattr(source, "stereo_info", None)
         if info is not None:
             log.info("%s: stereo calibration %s", name, info)
             self.stereo_info = info
             self._broadcast_text(json.dumps(info))
         period = 1.0 / opts["fps"]
-        window_start, window_frames = time.time(), 0
+        produced = 0
+        last_frame = window_start = time.time()
+        window_frames = 0
         try:
             while not self._stop.is_set():
                 t0 = time.time()
                 frame = source.read()
+                now = time.time()
+                # fps updates every second even with no frames, so a stall shows as 0.
+                if now - window_start >= 1.0:
+                    st["fps"] = round(window_frames / (now - window_start), 1)
+                    window_start, window_frames = now, 0
                 if frame is None:
+                    if now - last_frame > STALL_S:
+                        st["fps"] = 0.0
+                        return produced
                     time.sleep(0.01)
                     continue
-                data = _encode(frame, opts["jpeg_quality"])
+                last_frame = now
+                # A commlink source learns its stereo calibration from the packets,
+                # after open; announce it the first time it appears or changes.
+                info = getattr(source, "stereo_info", None)
+                if info is not None and info != self.stereo_info:
+                    log.info("%s: stereo calibration %s", name, info)
+                    self.stereo_info = info
+                    self._broadcast_text(json.dumps(info))
+                # A source may hand over a ready-made JPEG (bytes): send it as is.
+                data = frame if isinstance(frame, (bytes, bytearray)) else _encode(frame, opts["jpeg_quality"])
                 if data:
                     self._broadcast(STREAM_IDS[name], data)
-                    self.stats[name]["frames"] += 1
+                    st["frames"] += 1
+                    produced += 1
                     window_frames += 1
-                if t0 - window_start >= 1.0:
-                    self.stats[name]["fps"] = round(window_frames / (t0 - window_start), 1)
-                    window_start, window_frames = t0, 0
                 dt = time.time() - t0
                 if dt < period:
                     time.sleep(period - dt)
         finally:
-            source.close()
+            try:
+                source.close()
+            except Exception as e:  # noqa: BLE001 -- a wedged device may fail to close; reopen anyway
+                log.warning("%s: close failed: %s", name, e)
+        return produced
 
-    def _run_stub(self, name, opts, label):
-        self.stats[name]["source"] = self.stats[name]["source"] or "stub"
+    def _run_stub(self, name, opts, label, duration=None):
+        """Stub frames forever, or for `duration` seconds (between reopen attempts)."""
+        if self.stats[name]["source"] is None:
+            self.stats[name]["source"] = "stub"
         data = _encode(_make_stub_frame(label, opts["width"], opts["height"]), opts["jpeg_quality"])
-        while not self._stop.is_set():
+        end = None if duration is None else time.time() + duration
+        while not self._stop.is_set() and (end is None or time.time() < end):
             if data:
                 self._broadcast(STREAM_IDS[name], data)
                 self.stats[name]["frames"] += 1
