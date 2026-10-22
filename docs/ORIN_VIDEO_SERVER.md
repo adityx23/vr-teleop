@@ -84,7 +84,10 @@ halves should look nearly identical except for a small horizontal shift.
   cameras `CAM_B`/`CAM_C`, no `CAM_A`; USB 2). Not UVC devices, so they use
   the `oak` source (depthai v3), selected by **device id** (USB ports move
   between boots): `gripper_left` = `18443010D1B3121300`, `gripper_right` =
-  `194430103195095A00`, each `CAM_C` at 640x400. Left/right was mapped from
+  `194430103195095A00`, each `CAM_C` at 1280x800 (full sensor) @ 30, JPEG made on the
+  camera (`"encode": "device"`, default): ~75 KB/frame at quality 50, ~4.5 MB/s for both,
+  fits USB 2. The old raw-BGR path (`"encode": "host"`) caps USB 2 at 640x400 @ 30.
+  Quality 70 (~142 KB/frame) overran the headset's Wi-Fi link (frames dropped) on 2026-10-21. Left/right was mapped from
   which camera was on the right gripper first; confirm by covering one lens.
   depthai 3.11.0 is the `~/.local` install, symlinked into the `vr_teleop`
   env (`depthai.cpython-310-*.so` + `depthai.libs`); `~/depthai-core` is the

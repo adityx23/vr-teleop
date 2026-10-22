@@ -181,6 +181,10 @@ class OakSource:
                 the OAK-D-SR has only CAM_B / CAM_C)
       "device": device id (mxid), if more than one OAK is attached
       "usb":    "high" (USB 2, default -- most reliable behind hubs) | "super"
+      "encode": "device" (default: the camera's JPEG encoder; ~6 MB/s at
+                1280x800 @ 30, fits USB 2) | "host" (raw BGR over USB,
+                encoded here; USB 2 tops out at 640x400 @ 30). "rotate"
+                forces "host" (the frame has to be decoded to rotate it).
     width/height are the output size; keep the sensor's aspect ratio (e.g.
     640x400 for the SR's 1280x800) or the image is cropped."""
 
@@ -212,16 +216,26 @@ class OakSource:
                 raise RuntimeError("no color camera on this OAK")
             self.pipeline = dai.Pipeline(self.device)
             cam = self.pipeline.create(dai.node.Camera).build(socket)
-            out = cam.requestOutput((int(opts["width"]), int(opts["height"])),
-                                    type=dai.ImgFrame.Type.BGR888i, fps=float(opts["fps"]))
+            size, fps = (int(opts["width"]), int(opts["height"])), float(opts["fps"])
+            self.rotate = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                           270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(int(opts.get("rotate", 0)))
+            self.on_device = opts.get("encode", "device") == "device" and self.rotate is None
+            if self.on_device:
+                # JPEG made on the camera: ~20x less USB traffic than raw BGR, and no host encode.
+                out = cam.requestOutput(size, type=dai.ImgFrame.Type.NV12, fps=fps)
+                enc = self.pipeline.create(dai.node.VideoEncoder).build(
+                    out, frameRate=fps, profile=dai.VideoEncoderProperties.Profile.MJPEG)
+                enc.setQuality(int(opts["jpeg_quality"]))
+                out = enc.out
+            else:
+                out = cam.requestOutput(size, type=dai.ImgFrame.Type.BGR888i, fps=fps)
             self.queue = out.createOutputQueue(maxSize=1, blocking=False)  # newest frame only
             self.pipeline.start()
         except Exception:
             self.device.close()
             raise
-        self.rotate = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
-                       270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(int(opts.get("rotate", 0)))
-        self.desc = f"oak:{self.device.getDeviceName()}:{self.device.getDeviceId()}:{socket.name}"
+        self.desc = (f"oak:{self.device.getDeviceName()}:{self.device.getDeviceId()}:{socket.name}"
+                     f":{'jpeg-on-device' if self.on_device else 'host-encode'}:{self.device.getUsbSpeed().name}")
         self._failed = False
 
     def read(self):
@@ -231,6 +245,8 @@ class OakSource:
             msg = self.queue.get(timeout=timedelta(milliseconds=200))
             if msg is None:
                 return None
+            if self.on_device:
+                return msg.getData().tobytes()  # ready-made JPEG, sent as is
             frame = msg.getCvFrame()
         except Exception as e:  # noqa: BLE001 -- device unplugged / crashed / queue closed
             if not self._failed:
