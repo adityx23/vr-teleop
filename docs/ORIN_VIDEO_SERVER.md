@@ -103,8 +103,9 @@ halves should look nearly identical except for a small horizontal shift.
 ```bash
 cd ~/yor_ws/vr-teleop && ./start_video.sh   # Ctrl-C to stop
 ```
-Needs `python3 ~/yor_ws/zed_rgbd.py --publish --stereo` running too (any
-order): it owns the ZED and publishes `zed/view` on 127.0.0.1:5551 (left
+Needs the ZED publisher running too (any order): `python3 ~/yor_ws/collect.py
+--task "..."` while recording data, otherwise `python3 ~/yor_ws/zed_rgbd.py
+--vr-only`. Whichever runs owns the ZED and publishes `zed/view` on 127.0.0.1:5551 (left
 color JPEG + stereo [left|right] JPEG + `stereo_info`, no depth). This is
 approach 2 below. `camera_config.orin.json`: `head` stub (duplicate of the
 stereo left eye, ~30 Mbit/s saved), `head_stereo` = `commlink` source

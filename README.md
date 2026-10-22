@@ -65,12 +65,13 @@ Constants (scales, speed limits, neck signs/offsets, lift) are in
 
 **Orin** (cameras), two terminals:
 ```bash
-cd ~/yor_ws && python3 zed_rgbd.py --publish --stereo   # owns the ZED; publishes zed/view on :5551
+cd ~/yor_ws && python3 collect.py --task "..."           # owns the ZED + OAKs, records; publishes zed/view on :5551
+#   (not recording: cd ~/yor_ws && python3 zed_rgbd.py --vr-only)
 cd ~/yor_ws/vr-teleop && ./start_video.sh                # video server, port 8444
 ```
 The video server doesn't open the ZED: `head_stereo` forwards the stereo JPEG
-`zed_rgbd.py` publishes (3840x1080, both eyes 1920x1080) byte for byte, so
-the ZED can also record/feed depth at the same time. The mono `head` stream
+that collect.py (or `zed_rgbd.py --vr-only`) publishes (3840x1080, both eyes
+1920x1080) byte for byte, so the ZED records color + depth at the same time. The mono `head` stream
 is a stub (the headset hides it while stereo arrives). The two OAK-D-SR
 wrist cams are opened by the video server. Start order doesn't matter.
 Uses the `vr_teleop` micromamba env. Check with
