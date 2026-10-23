@@ -23,16 +23,17 @@ Teleop starts OFF. Controls:
   head                  neck pan/tilt; straight ahead re-zeroes each time teleop turns on
   right stick click     episode start / end as success;  left stick click  end as fail
   left stick (teleop off)  move the headset HUD up/down
-  right trigger         SameHand fingers: 0 open .. full pull = closed (touching)
+  trigger               that arm's gripper: 0 open .. full pull = closed
   A + Y (hold)          lift down;  X + B (hold) lift up;  release stops
-The lift's automatic head-height retargeting stays off. The left trigger is unused (no left gripper).
+The lift's automatic head-height retargeting stays off. --gripper-sides picks which triggers
+drive a gripper (default left,right = AgileX on both arms; right = SameHand only).
 The Pico lift keeps moving until it gets "stop": this script sends stop on release, teleop off,
 stale/lost headset, home, and exit -- but a hard crash (kill -9) mid-move would not.
 
-SameHand fingers: start the hand first (~/SameHand-UMI/device/software/run.sh start calib
-bridge). They stay limp until the first right-arm clutch with teleop on, then hold their last
-target while unclutched (so a grasp survives a re-clutch), and go limp again when teleop turns
-off, on home, on headset disconnect, and when this script exits. --no-gripper leaves them alone.
+Grippers stay limp until that arm's first clutch with teleop on, then hold their last target
+while unclutched (so a grasp survives a re-clutch), and go limp again when teleop turns off, on
+home, on headset disconnect, and when this script exits. --no-gripper leaves them alone.
+SameHand fingers: start the hand first (~/SameHand-UMI/device/software/run.sh start calib bridge).
 
 Episodes: the stick clicks work with teleop on or off, so they can mark policy rollouts
 too. Each start/end is published as JSON over ZMQ PUB (default *:5558, --episode-port) in
@@ -100,7 +101,7 @@ HUD_REFRESH_S = 0.2  # how often the headset HUD's robot status is re-read
 LIFT_RANGE_M = (0.0, 0.66)  # lift travel shown on the HUD (robot/config.py LIFT_MIN_M/LIFT_MAX_M)
 BASE_STOP_TICKS = 5  # zero-velocity commands sent when leaving base mode
 LIFT_STOP_TICKS = 3  # lift_stop commands sent after a lift button release
-GRIPPER_SIDE = "right"  # the SameHand is on the right arm; the left has no gripper
+GRIPPER_SIDES = SIDES  # arms with a gripper; the SameHand setup has only the right one (--gripper-sides)
 GRIPPER_MIN_CHANGE = 0.01  # don't resend gripper targets that barely changed
 GRIPPER_RETRY_S = 5.0  # wait this long before retrying a failed gripper enable (bridge down)
 BUTTON_NAMES = {
@@ -112,7 +113,7 @@ BUTTON_NAMES = {
 FAKE_HUD = {
     "dry_run": True, "rpc_ok": True, "error": None, "homing": False,
     "neck": {"pan": 0.0, "tilt": 0.0, "pan_lim": [-60.0, 60.0], "tilt_lim": [-30.0, 30.0]},
-    "gripper": {"left": None, "right": 0.6}, "ik_ok": {"left": True, "right": True},
+    "gripper": {"left": 0.6, "right": 0.6}, "ik_ok": {"left": True, "right": True},
     "lift": {"height": 0.10, "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1]},
     "base_vel": [0.0, 0.0, 0.0],
 }
@@ -180,7 +181,7 @@ class RobotLink:
     also keeps a cache of measured EE / neck poses for the controller."""
 
     def __init__(self, host, port, rate_hz, neck_hz, use_neck, use_arms, use_base, use_gripper=True, use_lift=True,
-                 neck_calib=None, arm_preview_s=ARM_PREVIEW_S):
+                 neck_calib=None, arm_preview_s=ARM_PREVIEW_S, gripper_sides=GRIPPER_SIDES):
         from commlink import RPCClient
 
         self.rpc = RPCClient(host, port)
@@ -189,6 +190,7 @@ class RobotLink:
         self.neck_every = max(1, round(rate_hz / neck_hz))
         self.use_neck, self.use_arms, self.use_base = use_neck, use_arms, use_base
         self.use_gripper = use_gripper and use_arms
+        self.gripper_sides = tuple(gripper_sides)
         self.use_lift = use_lift
         try:
             # Attribute lookups are RPC round trips too, so keep them inside the timeout.
@@ -223,9 +225,9 @@ class RobotLink:
         self.lift_sent = None  # "up" | "down" | None: last direction sent
         self.lift_stop_left = 0
         self.sent = {"arm": 0, "base": 0, "neck": 0, "grip": 0}
-        self.gripper_on = False  # torque on (enable_right_gripper succeeded)
-        self.gripper_sent = None  # last opening sent (1 open .. 0 closed)
-        self.gripper_retry_at = 0.0
+        self.gripper_on = {s: False for s in self.gripper_sides}  # torque on (enable_<side>_gripper succeeded)
+        self.gripper_sent = {s: None for s in self.gripper_sides}  # last opening sent (1 open .. 0 closed)
+        self.gripper_retry_at = {s: 0.0 for s in self.gripper_sides}
         self.error = None
         self.last_loop = time.monotonic()
         self.hud_state = {}  # robot status for the headset HUD, see hud()
@@ -263,7 +265,8 @@ class RobotLink:
             return "HOMING"
         s = f"sent arm {self.sent['arm']} base {self.sent['base']} neck {self.sent['neck']}"
         if self.use_gripper:
-            s += f" grip {self.sent['grip']} ({'on' if self.gripper_on else 'limp'})"
+            on = "/".join(f"{side[0].upper()} {'on' if self.gripper_on[side] else 'limp'}" for side in self.gripper_sides)
+            s += f" grip {self.sent['grip']} ({on})"
         return s + (f"  RPC ERROR {self.error[:70]}" if self.error else "")
 
     # --- own thread ---
@@ -358,39 +361,42 @@ class RobotLink:
         self.sent["arm"] += 1
 
     def _gripper_off(self):
-        if self.gripper_on:
-            self._call(f"disable_{GRIPPER_SIDE}_gripper")
-            log.info("Gripper limp")
-        self.gripper_on = False
-        self.gripper_sent = None
+        for side in self.gripper_sides:
+            if self.gripper_on[side]:
+                self._call(f"disable_{side}_gripper")
+                log.info("%s gripper limp", side)
+            self.gripper_on[side] = False
+            self.gripper_sent[side] = None
 
     def _send_gripper(self, cmds):
-        """Right trigger -> SameHand. Torque on at the first clutch with teleop on; held while
-        unclutched (gripper is None); limp when teleop goes off."""
+        """Trigger -> that arm's gripper. Torque on at the arm's first clutch with teleop on; held
+        while unclutched (gripper is None); limp when teleop goes off."""
         if not cmds["enabled"]:
             self._gripper_off()
             return
-        g = cmds["arms"][GRIPPER_SIDE]["gripper"]  # close amount 0..1, None when unclutched
-        if g is None:
-            return
-        if not self.gripper_on:
-            now = time.monotonic()
-            if now < self.gripper_retry_at:
-                return
-            if not self._call(f"enable_{GRIPPER_SIDE}_gripper"):
-                self.gripper_retry_at = now + GRIPPER_RETRY_S
-                if self.error is None:
-                    self.error = "gripper enable failed (SameHand bridge running? yor.py --no-samehand?)"
-                log.warning("Gripper enable failed; retrying in %.0f s", GRIPPER_RETRY_S)
-                return
-            self.gripper_on = True
-            self.gripper_sent = None
-            log.info("Gripper on")
-        pos = 1.0 - float(g)  # CanGripper convention: 1 open, 0 closed
-        if self.gripper_sent is None or abs(pos - self.gripper_sent) >= GRIPPER_MIN_CHANGE:
-            self._call(f"set_{GRIPPER_SIDE}_gripper", gripper_pos=pos)
-            self.gripper_sent = pos
-            self.sent["grip"] += 1
+        for side in self.gripper_sides:
+            g = cmds["arms"][side]["gripper"]  # close amount 0..1, None when unclutched
+            if g is None:
+                continue
+            if not self.gripper_on[side]:
+                now = time.monotonic()
+                if now < self.gripper_retry_at[side]:
+                    continue
+                if not self._call(f"enable_{side}_gripper"):
+                    self.gripper_retry_at[side] = now + GRIPPER_RETRY_S
+                    if self.error is None:
+                        self.error = (f"{side} gripper enable failed (yor.py started without it? "
+                                      "SameHand: bridge running?)")
+                    log.warning("%s gripper enable failed; retrying in %.0f s", side, GRIPPER_RETRY_S)
+                    continue
+                self.gripper_on[side] = True
+                self.gripper_sent[side] = None
+                log.info("%s gripper on", side)
+            pos = 1.0 - float(g)  # CanGripper convention: 1 open, 0 closed
+            if self.gripper_sent[side] is None or abs(pos - self.gripper_sent[side]) >= GRIPPER_MIN_CHANGE:
+                self._call(f"set_{side}_gripper", gripper_pos=pos)
+                self.gripper_sent[side] = pos
+                self.sent["grip"] += 1
 
     def _send_base(self, cmds):
         if cmds["base_mode"]:
@@ -854,16 +860,19 @@ class Runner:
 
 
 def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPISODE_HOST,
-         episode_port=DEFAULT_EPISODE_PORT, episode_dir="episodes"):
+         episode_port=DEFAULT_EPISODE_PORT, episode_dir="episodes", gripper_sides=GRIPPER_SIDES):
     """default_video / neck_calib: the YOR launcher passes the Orin address and
     robot/neck/neck_calibration.json (its "home_deg" is the neck's straight-ahead).
-    episode_host / episode_port: where the episode signals are published."""
+    episode_host / episode_port: where the episode signals are published.
+    gripper_sides: default for --gripper-sides (arms whose trigger drives a gripper)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="don't connect to the robot; print commands only")
     parser.add_argument("--no-arms", action="store_true", help="don't drive the arms")
     parser.add_argument("--no-base", action="store_true", help="don't drive the base")
     parser.add_argument("--no-neck", action="store_true", help="don't drive the neck")
-    parser.add_argument("--no-gripper", action="store_true", help="don't drive the SameHand fingers")
+    parser.add_argument("--no-gripper", action="store_true", help="don't drive the grippers")
+    parser.add_argument("--gripper-sides", default=",".join(gripper_sides),
+                        help="comma-separated arms whose trigger drives a gripper (default %(default)s)")
     parser.add_argument("--no-lift", action="store_true", help="ignore the lift buttons (A + Y / X + B)")
     parser.add_argument("--arm-speed", type=float, default=1.4, help="max arm target speed, m/s")
     parser.add_argument("--arm-preview", type=float, default=ARM_PREVIEW_S,
@@ -929,7 +938,8 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
         link = RobotLink(args.rpc_host, args.rpc_port, args.rate, args.neck_hz,
                          use_neck=not args.no_neck, use_arms=not args.no_arms, use_base=not args.no_base,
                          use_gripper=not args.no_gripper, use_lift=not args.no_lift,
-                         neck_calib=args.neck_calib, arm_preview_s=args.arm_preview)
+                         neck_calib=args.neck_calib, arm_preview_s=args.arm_preview,
+                         gripper_sides=[x for x in args.gripper_sides.split(",") if x])
         if link.neck_limits:
             cfg.neck_limits_deg = link.neck_limits_with_margin()
             cfg.neck_pan_offset_deg = link.neck_home["pan"]  # head straight ahead -> neck home

@@ -41,9 +41,9 @@ Every control tick (30 Hz), only for parts that are active:
 | `set_left_ee_target(ee_target=SE3, gripper_target=None, preview_time=)` / `set_right_...` | one arm clutched |
 | `set_base_velocity(np.array([vx, vy, wz]))` | base frame, m/s and rad/s; zeros on leaving base mode |
 | `set_neck_position(pan=deg, tilt=deg)` | ~15 Hz, only when the goal changed by 0.2 deg or more |
-| `enable_right_gripper()` -> `bool` | on the first right-arm clutch with teleop on; retried every 5 s if False. Must return fast |
-| `set_right_gripper(gripper_pos=0..1)` | while the right arm is clutched |
-| `disable_right_gripper()` | teleop off, home, disconnect, exit |
+| `enable_{side}_gripper()` -> `bool` | on that arm's first clutch with teleop on; retried every 5 s if False. Must return fast |
+| `set_{side}_gripper(gripper_pos=0..1)` | while that arm is clutched |
+| `disable_{side}_gripper()` | teleop off, home, disconnect, exit |
 | `lift_up()`, `lift_down()`, `lift_stop()` | from A+Y / X+B. On the robot the lift **keeps moving until `lift_stop()`**; a sim should behave the same (move the setpoint at a fixed rate until stopped) |
 
 Periodic reads:
@@ -61,7 +61,7 @@ converged, or `None` if never asked), `base_cmd_vel` `[vx, vy, wz]`.
 (The robot also returns `timestamp`, `enc_vel`, `neck_cmd_deg`, `{side}_ee`,
 `{side}_joints`, `{side}_joints_cmd`; the bridge ignores them.)
 
-Homing (A+X held 1.5 s): `disable_right_gripper()`, `lift_stop()`,
+Homing (A+X held 1.5 s): `disable_{side}_gripper()`, `lift_stop()`,
 `set_base_velocity(zeros)`, `home_left_arm()`, `home_right_arm()`, `home_neck()`.
 
 ## How the robot does IK (to mirror it in sim)
@@ -83,7 +83,8 @@ converged command instead of sending the unconverged one.
   unverified; its automatic retargeting is off on the robot.
 
 ## Hardware differences to keep in mind
-- Left gripper is removed on the robot (`get_collection_state` reports `None`
-  for it); a sim may keep it.
-- Right gripper is a SameHand hand over Zenoh; `enable_right_gripper()` fails
-  while its bridge is down.
+- The gripper calls go to the arms in `--gripper-sides` (default both). Stock
+  setup: AgileX CAN grippers on both arms. SameHand setup (YOR `umami` branch):
+  left gripper removed (`get_collection_state` reports `None` for it), right is
+  a SameHand hand over Zenoh, and `enable_right_gripper()` fails while its
+  bridge is down.
