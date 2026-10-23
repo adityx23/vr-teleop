@@ -44,11 +44,16 @@ the same format robot/teleop/vr_teleop.py uses, so the Orin collector needs no c
   teleop/episode          one robot-state frame at --frame-hz (30) while an episode is open:
                           vr_teleop.py's frame keys (joints, joints_cmd, ee, ee_target,
                           grippers, ik_ok, base_vel/enc_vel, episode_id, seq) + neck_deg,
+                          (grippers: {side}_gripper = measured opening, None when feedback drops,
+                          with {side}_gripper_error saying why; {side}_gripper_cmd = commanded,
+                          None while limp -- neither is ever filled in from the other)
                           neck_cmd_deg, lift_height, lift_cmd (+1 up/-1 down/0), teleop_on. Read from yor.py, so it records
                           whatever drives the robot (teleop or a policy). ZED pose fields are
                           None: the Orin has the ZED and can join it by timestamp.
 Each episode is also saved here as --episode-dir/<episode_id>.yep, compressed to a few
 bytes per frame (episode_store.py; `python server/episode_store.py FILE` reads one).
+Dropped values are NaN there; each change of a *_error string is kept in the metadata's
+"errors" list as {seq, field, error} (error None = the signal came back).
 The headset HUD shows REC while an episode is open. An episode left open when this script
 exits is ended as a fail and saved; a headset disconnect leaves it open.
 
@@ -85,7 +90,8 @@ FRAME_HZ_DEFAULT = 30.0
 FRAME_FIELDS = ["timestamp", "teleop_on", "base_vel", "enc_vel", "neck_deg", "neck_cmd_deg", "lift_height",
                 "lift_cmd"] + [
     f"{side}_{k}" for side in ("left", "right") for k in
-    ("ee", "joints", "joints_cmd", "gripper", "gripper_measured", "gripper_cmd", "ee_target", "ik_ok")]
+    ("ee", "joints", "joints_cmd", "gripper", "gripper_cmd", "ee_target", "ik_ok")]
+ERROR_FIELDS = [f"{side}_gripper_error" for side in ("left", "right")]  # str | None; saved as changes
 
 log = logging.getLogger("whole_body_teleop")
 
@@ -510,6 +516,7 @@ class EpisodePublisher:
         self.started_at = None
         self.last_id = None
         self.frames = []
+        self.errors = []  # [{seq, field, error}] each time an ERROR_FIELDS value changes
         self.writers = []  # background episode-file writes still running
         self.frame_hz = None  # set by main() when frames are streamed
         log.info("Episode publisher on tcp://%s:%s (task %r), saving to %s", host, port,
@@ -545,6 +552,7 @@ class EpisodePublisher:
             self.started_mono = time.monotonic()
             self.started_at = time.time()
             self.frames = []
+            self.errors = []
             self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": self.started_at, "active": True,
                                                  "episode_id": episode_id, **self.meta})
         log.info("Episode STARTED %s (task %r)", episode_id, self.meta.get("task"))
@@ -558,6 +566,10 @@ class EpisodePublisher:
             frame["seq"] = len(self.frames)
             frame["active"] = True
             self._publish(EPISODE_FRAME_TOPIC, frame)
+            prev = self.frames[-1] if self.frames else {}
+            for k in ERROR_FIELDS:
+                if frame.get(k) != prev.get(k):
+                    self.errors.append({"seq": frame["seq"], "field": k, "error": frame.get(k)})
             self.frames.append(frame)
             return True
 
@@ -569,7 +581,7 @@ class EpisodePublisher:
             episode_id, frames, duration = self.episode_id, self.frames, time.monotonic() - self.started_mono
             meta = {**self.meta, "episode_id": episode_id, "success": bool(success),
                     "started_at": self.started_at, "ended_at": now, "num_frames": len(frames),
-                    "frame_hz": self.frame_hz}
+                    "frame_hz": self.frame_hz, "errors": self.errors}
             self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": now, "active": False, "success": bool(success),
                                                  "episode_id": episode_id, "num_frames": len(frames)})
             self._publish(EPISODE_RESULT_TOPIC, {"timestamp": now, "result": "success" if success else "fail",
@@ -648,7 +660,8 @@ class FrameStreamer:
             for side in SIDES:
                 s[f"{side}_ee"] = FAKE_STATE[f"{side}_ee"]
                 s.update({f"{side}_joints": [0.0] * 7, f"{side}_joints_cmd": None, f"{side}_gripper": None,
-                          f"{side}_gripper_cmd": None, f"{side}_ik_ok": None})
+                          f"{side}_gripper_cmd": None, f"{side}_gripper_error": "dry run: no robot",
+                          f"{side}_ik_ok": None})
             return s
         s = dict(self._rpc("get_collection_state"))
         s["lift_height"] = self._rpc("get_lift_height") if self.use_lift else None
@@ -663,14 +676,17 @@ class FrameStreamer:
              "neck_cmd_deg": s.get("neck_cmd_deg"), "lift_height": s.get("lift_height"),
              "lift_cmd": s.get("lift_cmd")}
         for side in SIDES:
-            measured, commanded = s.get(f"{side}_gripper"), s.get(f"{side}_gripper_cmd")
             arm = (cmds or {}).get("arms", {}).get(side) or {}
             f[f"{side}_ee"] = s.get(f"{side}_ee")
             f[f"{side}_joints"] = s.get(f"{side}_joints")
             f[f"{side}_joints_cmd"] = s.get(f"{side}_joints_cmd")
-            f[f"{side}_gripper"] = measured if measured is not None else commanded
-            f[f"{side}_gripper_measured"] = measured is not None
-            f[f"{side}_gripper_cmd"] = commanded
+            # Measured and commanded stay separate; a dropped reading is None plus an error.
+            f[f"{side}_gripper"] = s.get(f"{side}_gripper")
+            f[f"{side}_gripper_cmd"] = s.get(f"{side}_gripper_cmd")
+            error = s.get(f"{side}_gripper_error")
+            if f[f"{side}_gripper"] is None and error is None:  # older yor.py without the field
+                error = "no measured gripper opening from yor.py"
+            f[f"{side}_gripper_error"] = error
             target = arm.get("target")
             f[f"{side}_ee_target"] = [float(x) for x in target] if target is not None else s.get(f"{side}_ee")
             f[f"{side}_ik_ok"] = s.get(f"{side}_ik_ok")

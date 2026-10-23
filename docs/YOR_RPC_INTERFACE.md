@@ -55,8 +55,10 @@ Periodic reads:
 | `get_lift_height()` | 5 Hz (HUD only) | metres, or `None` |
 
 `get_collection_state()` keys the HUD reads: `neck_deg` `[pan, tilt]`,
-`{left,right}_gripper` (measured opening or `None`),
-`{left,right}_gripper_cmd` (commanded), `{left,right}_ik_ok` (last IK solve
+`{left,right}_gripper` (measured opening, `None` when feedback drops),
+`{left,right}_gripper_cmd` (commanded opening, `None` while limp),
+`{left,right}_gripper_error` (`None` while the measurement is live, else why it isn't;
+the bridge never fills one gripper value in from the other), `{left,right}_ik_ok` (last IK solve
 converged, or `None` if never asked), `base_cmd_vel` `[vx, vy, wz]`.
 (The robot also returns `timestamp`, `enc_vel`, `neck_cmd_deg`, `{side}_ee`,
 `{side}_joints`, `{side}_joints_cmd`; the bridge ignores them.)
