@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YOR Monitor</title>
+  <style>
+    :root {
+      --bg: #0b0d10; --panel: #14181d; --line: #262c34; --text: #e8eaed; --dim: #8b949e;
+      --ok: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff; --cmd: #d2a8ff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text);
+                 font: 14px/1.4 system-ui, sans-serif; }
+    header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px;
+             align-items: center; padding: 10px 16px; background: #0f1216; border-bottom: 1px solid var(--line); }
+    header h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 600; }
+    .pill { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 13px;
+            white-space: nowrap; color: var(--dim); }
+    .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+    .pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+    .pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+    .pill.rec { color: #fff; background: var(--bad); border-color: var(--bad); }
+    #alerts { margin: 12px 16px 0; display: none; padding: 8px 12px; border-radius: 8px;
+              border: 1px solid color-mix(in srgb, var(--bad) 50%, transparent);
+              background: color-mix(in srgb, var(--bad) 10%, transparent); }
+    #alerts div { color: #ffb4ab; font-family: ui-monospace, monospace; font-size: 13px; }
+    main { display: grid; gap: 12px; padding: 12px 16px 24px;
+           grid-template-columns: repeat(auto-fill, minmax(min(100%, 380px), 1fr)); }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+    section h2 { display: flex; gap: 8px; align-items: center; font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+    section h2 .pill { font-weight: 400; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: right; padding: 2px 6px; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; color: var(--dim); }
+    th { color: var(--dim); font-weight: 400; font-size: 12px; border-bottom: 1px solid var(--line); }
+    td.cmd { color: var(--cmd); }
+    td.na { color: var(--dim); }
+    .sub { color: var(--dim); font-size: 12px; margin: 10px 0 4px; }
+    .err { color: #ffb4ab; font-family: ui-monospace, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .bar { position: relative; height: 14px; background: #0b0d10; border: 1px solid var(--line); border-radius: 4px; margin: 4px 0; }
+    .bar .fill { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--info) 55%, transparent); border-radius: 3px; }
+    .bar .mark { position: absolute; top: -3px; bottom: -3px; width: 3px; margin-left: -1px; background: var(--cmd); border-radius: 2px; }
+    .legend { display: flex; gap: 14px; color: var(--dim); font-size: 12px; }
+    .legend b { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+    .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-variant-numeric: tabular-nums; }
+    .kv span:nth-child(odd) { color: var(--dim); }
+    button, select { font: inherit; color: var(--text); background: #1c2128; border: 1px solid var(--line);
+                     border-radius: 6px; padding: 4px 10px; }
+    button:hover { border-color: var(--info); }
+    #cam canvas { width: 100%; background: #000; border-radius: 6px; margin-top: 8px; display: none; }
+    .wide { grid-column: 1 / -1; }
+    a { color: var(--info); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>YOR monitor</h1>
+    <span id="p-feed" class="pill">connecting…</span>
+    <span id="p-teleop" class="pill">teleop —</span>
+    <span id="p-rec" class="pill">no episode</span>
+    <span id="p-link" class="pill">robot —</span>
+    <span id="p-headset" class="pill">headset —</span>
+  </header>
+  <div id="alerts"></div>
+  <main>
+    <section id="arm-left"></section>
+    <section id="arm-right"></section>
+    <section>
+      <h2>Base <span id="base-mode" class="pill">—</span></h2>
+      <table id="base"></table>
+    </section>
+    <section>
+      <h2>Lift and neck</h2>
+      <div class="kv" id="lift"></div>
+      <div class="bar" id="lift-bar"><div class="fill"></div></div>
+      <table id="neck"></table>
+    </section>
+    <section>
+      <h2>Episode</h2>
+      <div class="kv" id="episode"></div>
+      <div id="episode-errors"></div>
+    </section>
+    <section id="cam">
+      <h2>Camera <span id="cam-state" class="pill">off</span></h2>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+        <button id="cam-toggle">Show camera</button>
+        <select id="cam-stream">
+          <option value="3">ZED stereo (left eye)</option>
+          <option value="0">head</option>
+          <option value="1">gripper left</option>
+          <option value="2">gripper right</option>
+        </select>
+      </div>
+      <div class="sub">Off by default: this is a second viewer of the Orin's video, which adds Wi-Fi load next
+        to the headset. Accept the Orin's cert once at <a id="cam-cert" target="_blank" rel="noopener">its page</a>.</div>
+      <canvas id="cam-canvas"></canvas>
+    </section>
+  </main>
+  <script type="module" src="/static/monitor.js"></script>
+</body>
+</html>

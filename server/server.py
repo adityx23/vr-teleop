@@ -16,6 +16,8 @@ Run standalone:
 GET /health returns JSON with connected clients and per-stream fps.
 GET /config.json returns {"video": <default video host:port or null>}; the page
 uses it when its URL has no ?video= (pass default_video= to run()).
+With monitor= (a callable returning a JSON-safe dict), GET /monitor serves the read-only
+monitor page (static/monitor.html) and GET /monitor.json returns monitor().
 
 From the robot, use ../robot/whole_body_teleop.py, which calls run() with its
 own handler.
@@ -66,6 +68,14 @@ async def page_config(request):
     return web.json_response({"video": request.app["default_video"]})
 
 
+async def monitor_page(request):
+    return web.FileResponse(STATIC_DIR / "monitor.html")
+
+
+async def monitor_json(request):
+    return web.json_response(request.app["monitor"](), headers={"Cache-Control": "no-store"})
+
+
 async def websocket_handler(request):
     ws = web.WebSocketResponse(max_msg_size=4 * 1024 * 1024)
     await ws.prepare(request)
@@ -109,13 +119,13 @@ async def _no_cache(request, handler):
     """Page + static files: make the headset browser revalidate every load, so an edited
     main.js is picked up on a plain reload instead of an old cached copy running."""
     resp = await handler(request)
-    if request.path == "/" or request.path.startswith("/static/"):
+    if request.path in ("/", "/monitor") or request.path.startswith("/static/"):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
 def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None,
-             default_video=None):
+             default_video=None, monitor=None):
     """on_payload(payload_dict) -> status dict for the HUD (or None). Called on
     the event loop for every headset message, so it must not block. Pass
     on_payload=None for a video-only server."""
@@ -131,10 +141,14 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
     app["on_payload"] = on_payload
     app["on_connect"] = on_connect
     app["on_disconnect"] = on_disconnect
+    app["monitor"] = monitor
     app.router.add_get("/", index)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/health", health)
     app.router.add_get("/config.json", page_config)
+    if monitor is not None:
+        app.router.add_get("/monitor", monitor_page)
+        app.router.add_get("/monitor.json", monitor_json)
     app.router.add_static("/static/", STATIC_DIR, name="static")
 
     async def on_cleanup(app):
@@ -146,7 +160,7 @@ def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=Fals
 
 
 def run(on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None,
-        default_video=None, host=HOST, port=PORT, cert_path=CERT_PATH, key_path=KEY_PATH):
+        default_video=None, host=HOST, port=PORT, cert_path=CERT_PATH, key_path=KEY_PATH, monitor=None):
     """Serve until Ctrl-C. Blocks."""
     if not Path(cert_path).exists() or not Path(key_path).exists():
         raise FileNotFoundError(f"Missing TLS cert/key ({cert_path}, {key_path})")
@@ -157,7 +171,7 @@ def run(on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_c
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = make_app(loop, on_payload, on_connect, on_disconnect, cameras=cameras, camera_config=camera_config,
-                   default_video=default_video)
+                   default_video=default_video, monitor=monitor)
 
     log.info("Serving https://%s:%s  (cameras %s)", host, port, "on" if cameras else "off")
     web.run_app(app, host=host, port=port, ssl_context=ssl_context, loop=loop, print=None)

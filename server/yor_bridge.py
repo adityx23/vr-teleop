@@ -56,7 +56,13 @@ Each episode is also saved here as --episode-dir/<episode_id>.yep, compressed to
 bytes per frame (episode_store.py; `python server/episode_store.py FILE` reads one).
 Dropped values are NaN there; each change of a *_error string is kept in the metadata's
 "errors" list as {seq, field, error} (error None = the signal came back).
-The headset HUD shows REC while an episode is open. An episode left open when this script
+The headset HUD shows REC while an episode is open.
+
+Monitor: https://<pi-ip>:<port>/monitor in any browser on the LAN (accept the cert once) shows
+teleop state, every arm/gripper/base/lift/neck value measured vs commanded, episodes and
+errors, refreshed 5x a second from /monitor.json. Read-only: it never sends commands, and
+it reuses what the bridge already reads for the HUD, so it adds no robot RPC calls. Its
+camera view is off until you switch it on (a second video viewer adds Wi-Fi load). An episode left open when this script
 exits is ended as a fail and saved; a headset disconnect leaves it open.
 
 Needs: aiohttp, pyzmq, mink (yor-nero env) and the openssl CLI (self-signed cert).
@@ -162,6 +168,21 @@ def ensure_cert(extra_ips, regen=False):
     log.info("Generated TLS cert for %s", ", ".join(ips))
 
 
+def _jsonable(v):
+    """numpy arrays/scalars -> lists/floats, recursively, for /monitor.json."""
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return v
+
+
 # ---------------------------------------------------------------- robot link
 def _call_with_timeout(fn, timeout_s):
     """Run fn() in a thread; raise TimeoutError if it doesn't return in time.
@@ -240,6 +261,7 @@ class RobotLink:
         self.error = None
         self.last_loop = time.monotonic()
         self.hud_state = {}  # robot status for the headset HUD, see hud()
+        self.monitor_robot = None  # last full get_collection_state() + lift height, see monitor()
         self.stop = threading.Event()
         log.info("Robot link up: neck %s, arms %s, base %s. Neck limits %s, home %s",
                  "on" if use_neck else "off", "on" if use_arms else "off", "on" if use_base else "off",
@@ -266,6 +288,21 @@ class RobotLink:
         out.update(dry_run=False, rpc_ok=self.error is None and time.monotonic() - self.last_loop <= 1.0,
                    error=self.error, homing=self.homing)
         return out
+
+    def monitor(self):
+        """Robot link part of /monitor.json (web thread; only copies, never calls the robot)."""
+        with self.lock:
+            robot = dict(self.monitor_robot) if self.monitor_robot else None
+        return {
+            "rpc_ok": self.error is None and time.monotonic() - self.last_loop <= 1.0,
+            "loop_age_s": time.monotonic() - self.last_loop, "error": self.error, "homing": self.homing,
+            "sent": dict(self.sent), "neck_sent": self.neck_sent, "lift_sent": self.lift_sent,
+            "use": {"arms": self.use_arms, "base": self.use_base, "neck": self.use_neck,
+                    "gripper": self.use_gripper, "lift": self.use_lift},
+            "gripper_sides": list(self.gripper_sides), "gripper_on": dict(self.gripper_on),
+            "gripper_sent": dict(self.gripper_sent),
+            "robot": robot,
+        }
 
     def status(self):
         if time.monotonic() - self.last_loop > 1.0:
@@ -335,6 +372,8 @@ class RobotLink:
         hud["lift"] = None if h is None else {"height": float(h), "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1]}
         with self.lock:
             self.hud_state = hud
+            self.monitor_robot = {"state": cs or None, "lift_height": None if h is None else float(h),
+                                  "read_at": time.time()}
 
     def _home_all(self):
         self.homing = True
@@ -746,6 +785,8 @@ class Runner:
         self.link = link
         self.episodes = episodes
         self.last_commands = None  # for FrameStreamer
+        self.frames = None  # FrameStreamer, if frames are streamed (for the monitor)
+        self.monitor_loop = {}  # control-loop snapshot for /monitor.json
         self.lock = threading.Lock()
         self.latest = None  # (payload, monotonic receive time)
         self.rx_times = []
@@ -819,6 +860,8 @@ class Runner:
                 self.rx_times = [t for t in self.rx_times if t0 - t <= 1.0]
                 rx_hz = len(self.rx_times)
                 clients = self.clients
+                self.monitor_loop = {"at": time.time(), "status": status, "commands": commands,
+                                     "headset": {"clients": clients, "rx_hz": rx_hz, "fresh": fresh}}
             if commands["enabled"] != was_enabled:
                 was_enabled = commands["enabled"]
                 log.info("Teleop %s", "ON" if was_enabled else "OFF")
@@ -832,6 +875,31 @@ class Runner:
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
         if self.episodes is not None:
             self.episodes.close()
+
+    def monitor_state(self):
+        """GET /monitor.json (web thread). Only copies what the loops already have."""
+        with self.lock:
+            loop = dict(self.monitor_loop)
+        cmds = loop.get("commands") or {}
+        out = {
+            "time": time.time(), "dry_run": self.link is None, "rate_hz": self.rate_hz,
+            "loop_age_s": None if not loop else time.time() - loop["at"],
+            "headset": loop.get("headset"),
+            "teleop": loop.get("status"),
+            "commands": {k: cmds.get(k) for k in ("enabled", "arms", "base_mode", "base_velocity", "neck",
+                                                  "lift_manual", "warnings")} if cmds else None,
+            "link": self.link.monitor() if self.link else None,
+            "robot_fake": FAKE_HUD if self.link is None else None,
+            "episode": None,
+        }
+        if self.episodes is not None:
+            ep = self.episodes
+            out["episode"] = {**ep.hud(), "last_id": ep.last_id, "meta": ep.meta,
+                              "errors": list(ep.errors[-20:]) if ep.active else [],
+                              "frame_hz": ep.frame_hz}
+            if self.frames is not None:
+                out["episode"].update(frames_late=self.frames.late, frames_failed=self.frames.failed)
+        return _jsonable(out)
 
     # --- printing ---
     @staticmethod
@@ -990,6 +1058,7 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
                                rpc_host=None if args.dry_run else args.rpc_host, rpc_port=args.rpc_port,
                                use_lift=not args.no_lift)
         episodes.frame_hz = args.frame_hz
+        runner.frames = frames
         threading.Thread(target=frames.run, daemon=True).start()
 
     ips = [ip for ip in lan_ips() if ip.startswith("192.168.")] or lan_ips() or ["<pi-ip>"]
@@ -999,9 +1068,11 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
              "  ".join(f"https://{ip}:{args.port}" for ip in ips))
     if video:
         log.info("Video from %s -- accept its cert once at https://%s/ on the headset", video, video)
+    log.info("Monitor (any browser on the LAN, read-only): %s",
+             "  ".join(f"https://{ip}:{args.port}/monitor" for ip in ips))
     try:
         vr_server.run(runner.on_payload, runner.on_connect, runner.on_disconnect, cameras=False,
-                      default_video=video, port=args.port)
+                      default_video=video, port=args.port, monitor=runner.monitor_state)
     finally:
         if frames is not None:
             frames.stop.set()
