@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { VRButton } from "three/addons/webxr/VRButton.js";
+import { latestFrameDecoder } from "./latest_frame.mjs";
 
 const statusEl = document.getElementById("status");
 
@@ -30,7 +31,7 @@ const links = {
   video: videoHost ? { url: `${wsProto}://${videoHost}/ws`, ws: null, state: "connecting" } : null,
 };
 
-let framesReceived = 0;
+let framesDisplayed = 0;
 let fps = 0;
 let lastFpsTime = performance.now();
 let lastVideoFrameTime = 0;
@@ -54,6 +55,10 @@ function connect(name) {
   ws.addEventListener("open", () => { link.state = "open"; setStatus(); });
   ws.addEventListener("error", () => { link.state = "error"; setStatus(); });
   ws.addEventListener("close", () => {
+    if (name === "video" || !links.video) {
+      for (const decoder of Object.values(frameDecoders)) decoder.reset();
+      stereoDecoder.reset();
+    }
     if (link.state !== "error") link.state = "disconnected";
     setStatus();
     setTimeout(() => connect(name), 2000); // servers may restart; keep retrying
@@ -110,42 +115,44 @@ for (const [id, info] of Object.entries(STREAMS)) {
   streamTextures[id] = texture;
 }
 
-async function handleFrame(buffer) {
-  const bytes = new Uint8Array(buffer);
-  if (bytes.length < 2) return;
-  const streamId = bytes[0];
-  if (streamId === STEREO_STREAM_ID) {
-    framesReceived++;
+function markDisplayed(streamId) {
+  if (streamId === STEREO_STREAM_ID || !stereoActive()) {
+    framesDisplayed++;
     lastVideoFrameTime = performance.now();
-    handleStereoFrame(bytes.subarray(1));
-    return;
   }
-  const entry = streamCanvases[streamId];
-  if (!entry) return;
+}
 
-  framesReceived++;
-  lastVideoFrameTime = performance.now();
-  const blob = new Blob([bytes.subarray(1)], { type: "image/jpeg" });
-  try {
-    const bitmap = await createImageBitmap(blob);
+const decodeJpeg = (bytes) => createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+const frameDecoders = {};
+for (const [id, entry] of Object.entries(streamCanvases)) {
+  frameDecoders[id] = latestFrameDecoder(decodeJpeg, (bitmap) => {
     // Match the canvas to the stream, so a higher-res camera isn't squashed to 640x480.
     if (entry.canvas.width !== bitmap.width || entry.canvas.height !== bitmap.height) {
       entry.canvas.width = bitmap.width;
       entry.canvas.height = bitmap.height;
-      streamTextures[streamId].dispose(); // reallocate at the new size
+      streamTextures[id].dispose(); // reallocate at the new size
     }
     entry.ctx.drawImage(bitmap, 0, 0);
-    streamTextures[streamId].needsUpdate = true;
-    bitmap.close();
-  } catch (e) {
-    // ignore malformed frame
+    streamTextures[id].needsUpdate = true;
+    markDisplayed(Number(id));
+  });
+}
+
+function handleFrame(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 2) return;
+  const streamId = bytes[0];
+  if (streamId === STEREO_STREAM_ID) {
+    stereoDecoder.push(bytes.subarray(1));
+    return;
   }
+  frameDecoders[streamId]?.push(bytes.subarray(1));
 }
 
 setInterval(() => {
   const now = performance.now();
-  fps = Math.round((framesReceived * 1000) / (now - lastFpsTime));
-  framesReceived = 0;
+  fps = Math.round((framesDisplayed * 1000) / (now - lastFpsTime));
+  framesDisplayed = 0;
   lastFpsTime = now;
   setStatus();
 }, 1000);
@@ -258,9 +265,7 @@ function handleStereoInfo(msg) {
   console.log("stereo_info", msg);
 }
 
-async function handleStereoFrame(jpegBytes) {
-  try {
-    const bitmap = await createImageBitmap(new Blob([jpegBytes], { type: "image/jpeg" }));
+const stereoDecoder = latestFrameDecoder(decodeJpeg, (bitmap) => {
     if (stereoCanvas.width !== bitmap.width || stereoCanvas.height !== bitmap.height) {
       stereoCanvas.width = bitmap.width;
       stereoCanvas.height = bitmap.height;
@@ -268,12 +273,9 @@ async function handleStereoFrame(jpegBytes) {
     }
     stereoCtx.drawImage(bitmap, 0, 0);
     stereoTexture.needsUpdate = true;
-    bitmap.close();
     lastStereoFrameTime = performance.now();
-  } catch (e) {
-    // ignore malformed frame
-  }
-}
+    markDisplayed(STEREO_STREAM_ID);
+});
 
 function stereoActive() {
   return performance.now() - lastStereoFrameTime < 1000;
