@@ -29,10 +29,10 @@ import numpy as np
 @dataclass
 class LiftConfig:
     enabled: bool = True
-    # Lift travel, metres. The IK model's lift_joint is 0..0.208 m -- VERIFY
-    # against the real Pico lift (build step 3).
+    # Lift travel, metres: the real Pico lift's hard stops are 0.000 / 0.6726 m
+    # (measured 2026-10-23), less ~1 cm at the top (robot/config.py LIFT_MAX_M).
     min_h: float = 0.0
-    max_h: float = 0.20
+    max_h: float = 0.66
     head_gain: float = 1.0
     w_head: float = 1.0
     w_reach: float = 4.0
@@ -40,8 +40,9 @@ class LiftConfig:
     # lift 0). Home EE z is ~0.89 m in the IK model. Placeholder -- VERIFY.
     reach_lo: float = 0.75
     reach_hi: float = 1.05
-    # Setpoint slew limit. The real lift's speed is unknown -- VERIFY.
-    max_speed_mps: float = 0.05
+    # Setpoint slew limit: the real lift's slower direction (up 26.5 mm/s,
+    # down 30.8 mm/s, constant; robot/config.py LIFT_UP/DOWN_RATE_MPS).
+    max_speed_mps: float = 0.0265
 
 
 def _interval_dist(x, lo, hi):
