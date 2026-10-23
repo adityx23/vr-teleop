@@ -46,7 +46,9 @@ the same format robot/teleop/vr_teleop.py uses, so the Orin collector needs no c
                           grippers, ik_ok, base_vel/enc_vel, episode_id, seq) + neck_deg,
                           (grippers: {side}_gripper = measured opening, None when feedback drops,
                           with {side}_gripper_error saying why; {side}_gripper_cmd = commanded,
-                          None while limp -- neither is ever filled in from the other)
+                          None while limp -- neither is ever filled in from the other;
+                          {side}_ee_target = the teleop's target pose, None with
+                          {side}_ee_target_error when there is none, never the measured pose)
                           neck_cmd_deg, lift_height, lift_cmd (+1 up/-1 down/0), teleop_on. Read from yor.py, so it records
                           whatever drives the robot (teleop or a policy). ZED pose fields are
                           None: the Orin has the ZED and can join it by timestamp.
@@ -91,7 +93,8 @@ FRAME_FIELDS = ["timestamp", "teleop_on", "base_vel", "enc_vel", "neck_deg", "ne
                 "lift_cmd"] + [
     f"{side}_{k}" for side in ("left", "right") for k in
     ("ee", "joints", "joints_cmd", "gripper", "gripper_cmd", "ee_target", "ik_ok")]
-ERROR_FIELDS = [f"{side}_gripper_error" for side in ("left", "right")]  # str | None; saved as changes
+ERROR_FIELDS = [f"{side}_{k}_error" for side in ("left", "right")
+                for k in ("gripper", "ee_target")]  # str | None; saved as changes
 
 log = logging.getLogger("whole_body_teleop")
 
@@ -688,7 +691,10 @@ class FrameStreamer:
                 error = "no measured gripper opening from yor.py"
             f[f"{side}_gripper_error"] = error
             target = arm.get("target")
-            f[f"{side}_ee_target"] = [float(x) for x in target] if target is not None else s.get(f"{side}_ee")
+            f[f"{side}_ee_target"] = None if target is None else [float(x) for x in target]
+            f[f"{side}_ee_target_error"] = None if target is not None else (
+                "no teleop commands yet" if cmds is None else
+                "teleop off" if not cmds["enabled"] else f"{side} arm not clutched")
             f[f"{side}_ik_ok"] = s.get(f"{side}_ik_ok")
         # The ZED base pose lives on the Orin; it can join it there by timestamp.
         f.update(base_pose=None, cam_pose=None, zed_timestamp=None, zed_age_s=None)
