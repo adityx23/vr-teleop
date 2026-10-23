@@ -37,7 +37,7 @@ SameHand fingers: start the hand first (~/SameHand-UMI/device/software/run.sh st
 
 Episodes: the stick clicks work with teleop on or off, so they can mark policy rollouts
 too. Each start/end is published as JSON over ZMQ PUB (default *:5558, --episode-port) in
-the same format robot/teleop/vr_teleop.py uses, so the Orin collector needs no change:
+the same format robot/teleop/vr_teleop.py uses (full field reference: docs/EPISODE_FORMAT.md):
   episode/signal          {timestamp, active: true, episode_id, task, ...metadata}   on start
   episode/signal          {timestamp, active: false, success, episode_id}            on end
   teleop/episode_result   {timestamp, result: "success" | "fail", episode_id}        on end
