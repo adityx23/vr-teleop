@@ -18,8 +18,10 @@ Controls (Quest Touch, WebXR "xr-standard" mapping):
                       those two face buttons: any other mix stops the lift)
   left stick          base vx / vy (base mode)
   right stick x       base yaw rate (base mode)
-  left stick click    recenter the neck's "straight ahead"
-  head                neck pan/tilt, always on
+  right stick click   episode: start, or end as success  (works with teleop off,
+  left stick click    episode: end as fail                so it can mark policy rollouts)
+  head                neck pan/tilt, always on; "straight ahead" is re-zeroed
+                      each time teleop turns on (so also after a home)
   head height + arms  lift (whole-body retargeting, only while an arm is clutched)
 
 Frames:
@@ -186,7 +188,7 @@ class WholeBodyTeleop:
         self._filters = {name: PoseFilter(self.cfg.pose_filter_alpha) for name in ("head",) + SIDES}
         self.base_mode = False
         self._prev_both_secondary = False
-        self._prev_recenter = False
+        self._prev_stick_click = {side: False for side in SIDES}
         self._neck_yaw0 = None
         self.neck_cmd = None  # {"pan", "tilt"} degrees, last commanded
         self.lift = LiftRetargeter(self.cfg.lift)
@@ -233,7 +235,8 @@ class WholeBodyTeleop:
                 commands["arms"][side] = {"clutched": False, "target": None, "gripper": None}
 
         commands["base_mode"], commands["base_velocity"] = self._update_base(ctrls)
-        commands["neck"] = self._update_neck(head, ctrls["left"], robot_state, dt)
+        commands["episode"] = self._update_episode_buttons(ctrls)
+        commands["neck"] = self._update_neck(head, robot_state, dt)
         commands["lift_target"] = self._update_lift(head, robot_state, dt)
         self.lift_manual = self._update_lift_buttons(ctrls)
         commands["lift_manual"] = self.lift_manual
@@ -463,17 +466,35 @@ class WholeBodyTeleop:
             return "up"
         return None
 
+    # ------------------------------------------------------------------ episode buttons
+    def _update_episode_buttons(self, ctrls):
+        """Stick-click press edges -> "start_or_success" (right) / "fail" (left) / None.
+        Independent of teleop on/off. While a controller isn't tracked its last button
+        state is kept, so a click held through a dropout doesn't fire twice."""
+        events = {}
+        for side in SIDES:
+            if ctrls[side] is None:
+                continue
+            pressed = _button(ctrls[side], STICK_CLICK_BUTTON)[0]
+            if pressed and not self._prev_stick_click[side]:
+                events[side] = True
+            self._prev_stick_click[side] = pressed
+        if events.get("right") and events.get("left"):
+            return None  # both at once: ambiguous, ignore
+        if events.get("right"):
+            return "start_or_success"
+        if events.get("left"):
+            return "fail"
+        return None
+
     # ------------------------------------------------------------------ neck
-    def _update_neck(self, head, left, robot_state, dt):
+    def _update_neck(self, head, robot_state, dt):
         cfg = self.cfg
-        recenter = _button(left, STICK_CLICK_BUTTON)[0]
-        recenter_edge = recenter and not self._prev_recenter
-        self._prev_recenter = recenter
         if not cfg.enable_neck or head is None or not self.enabled:
             return None
 
         yaw = _heading(head["R"])
-        if self._neck_yaw0 is None or recenter_edge:
+        if self._neck_yaw0 is None:
             self._neck_yaw0 = yaw
         f = head["R"] @ np.array([0.0, 0.0, -1.0])
         pitch = math.asin(float(np.clip(f[1], -1.0, 1.0)))  # against the horizon, up positive

@@ -358,13 +358,37 @@ def test_neck_follows_head():
     assert abs(out["neck"]["tilt"] + 20) < 1e-6
 
 
-def test_neck_recenter_and_limits():
+def test_neck_limits_and_rezero_on_enable():
     tele, clk = make(neck_max_speed_dps=1e6), Clock()
     run(tele, clk, payload())
     out = run(tele, clk, payload(head_q=yaw_quat(150)))
     assert out["neck"]["pan"] == 90.0  # clamped
     out = run(tele, clk, payload(head_q=yaw_quat(150), left=ctrl([0, 1, 0], buttons=[3])))
-    assert abs(out["neck"]["pan"]) < 1e-6  # recentered
+    assert out["neck"]["pan"] == 90.0  # left stick click no longer recenters
+    tele.set_enabled(False)
+    tele.set_enabled(True)
+    out = run(tele, clk, payload(head_q=yaw_quat(150)))
+    assert abs(out["neck"]["pan"]) < 1e-6  # turning teleop on re-zeroes straight ahead
+
+
+def test_episode_buttons():
+    tele, clk = make(start_enabled=False), Clock()  # works with teleop off (policy rollouts)
+    idle_l, idle_r = ctrl([0, 1, 0]), ctrl([0, 1, 0])
+    assert run(tele, clk, payload(left=idle_l, right=idle_r))["episode"] is None
+    out = run(tele, clk, payload(left=idle_l, right=ctrl([0, 1, 0], buttons=[3])))
+    assert out["episode"] == "start_or_success"
+    out = run(tele, clk, payload(left=idle_l, right=ctrl([0, 1, 0], buttons=[3])))
+    assert out["episode"] is None  # held: one event per press
+    assert run(tele, clk, payload(left=idle_l, right=None))["episode"] is None  # dropout
+    out = run(tele, clk, payload(left=idle_l, right=ctrl([0, 1, 0], buttons=[3])))
+    assert out["episode"] is None  # still held after the dropout: no second event
+    run(tele, clk, payload(left=idle_l, right=idle_r))
+    out = run(tele, clk, payload(left=ctrl([0, 1, 0], buttons=[3]), right=idle_r))
+    assert out["episode"] == "fail"
+    run(tele, clk, payload(left=idle_l, right=idle_r))
+    both = payload(left=ctrl([0, 1, 0], buttons=[3]), right=ctrl([0, 1, 0], buttons=[3]))
+    assert run(tele, clk, both)["episode"] is None  # both at once: ignored
+    assert tele.enabled is False
 
 
 def test_neck_offsets_and_signs():

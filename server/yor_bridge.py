@@ -20,7 +20,9 @@ Teleop starts OFF. Controls:
   A + X, hold 1.5 s           home both arms + neck, teleop off
   grip (hold)                 move that arm; release and it holds
   B + Y (one per hand)        base mode on/off;  left stick drive, right stick turn
-  head                  neck pan/tilt;  left stick click re-centers
+  head                  neck pan/tilt; straight ahead re-zeroes each time teleop turns on
+  right stick click     episode start / end as success;  left stick click  end as fail
+  left stick (teleop off)  move the headset HUD up/down
   right trigger         SameHand fingers: 0 open .. full pull = closed (touching)
   A + Y (hold)          lift down;  X + B (hold) lift up;  release stops
 The lift's automatic head-height retargeting stays off. The left trigger is unused (no left gripper).
@@ -32,7 +34,24 @@ bridge). They stay limp until the first right-arm clutch with teleop on, then ho
 target while unclutched (so a grasp survives a re-clutch), and go limp again when teleop turns
 off, on home, on headset disconnect, and when this script exits. --no-gripper leaves them alone.
 
-Needs: aiohttp, mink (yor-nero env) and the openssl CLI (self-signed cert).
+Episodes: the stick clicks work with teleop on or off, so they can mark policy rollouts
+too. Each start/end is published as JSON over ZMQ PUB (default *:5558, --episode-port) in
+the same format robot/teleop/vr_teleop.py uses, so the Orin collector needs no change:
+  episode/signal          {timestamp, active: true, episode_id, task, ...metadata}   on start
+  episode/signal          {timestamp, active: false, success, episode_id}            on end
+  teleop/episode_result   {timestamp, result: "success" | "fail", episode_id}        on end
+  teleop/episode          one robot-state frame at --frame-hz (30) while an episode is open:
+                          vr_teleop.py's frame keys (joints, joints_cmd, ee, ee_target,
+                          grippers, ik_ok, base_vel/enc_vel, episode_id, seq) + neck_deg,
+                          neck_cmd_deg, lift_height, lift_cmd (+1 up/-1 down/0), teleop_on. Read from yor.py, so it records
+                          whatever drives the robot (teleop or a policy). ZED pose fields are
+                          None: the Orin has the ZED and can join it by timestamp.
+Each episode is also saved here as --episode-dir/<episode_id>.yep, compressed to a few
+bytes per frame (episode_store.py; `python server/episode_store.py FILE` reads one).
+The headset HUD shows REC while an episode is open. An episode left open when this script
+exits is ended as a fail and saved; a headset disconnect leaves it open.
+
+Needs: aiohttp, pyzmq, mink (yor-nero env) and the openssl CLI (self-signed cert).
 """
 import argparse
 import json
@@ -43,6 +62,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +74,17 @@ from whole_body import SIDES, WholeBodyConfig, WholeBodyTeleop, _heading  # noqa
 import quat  # noqa: E402
 
 DEFAULT_VIDEO = os.environ.get("VR_VIDEO", "localhost:8444")
+DEFAULT_EPISODE_HOST = os.environ.get("EPISODE_PUB_HOST", "*")
+DEFAULT_EPISODE_PORT = int(os.environ.get("EPISODE_PUB_PORT", "5558"))
+EPISODE_SIGNAL_TOPIC = "episode/signal"
+EPISODE_RESULT_TOPIC = "teleop/episode_result"
+EPISODE_FRAME_TOPIC = "teleop/episode"
+FRAME_HZ_DEFAULT = 30.0
+# Saved per frame in the Pi-side .yep file (everything numeric in a frame).
+FRAME_FIELDS = ["timestamp", "teleop_on", "base_vel", "enc_vel", "neck_deg", "neck_cmd_deg", "lift_height",
+                "lift_cmd"] + [
+    f"{side}_{k}" for side in ("left", "right") for k in
+    ("ee", "joints", "joints_cmd", "gripper", "gripper_measured", "gripper_cmd", "ee_target", "ik_ok")]
 
 log = logging.getLogger("whole_body_teleop")
 
@@ -453,13 +484,240 @@ class RobotLink:
             self._gripper_off()
 
 
+# ------------------------------------------------------------------ episodes
+class EpisodePublisher:
+    """Episode start/end signals and the 30 Hz frame stream for the Orin collector, plus the
+    Pi-side copy of each episode (format: module docstring). Signals come from the control
+    thread, frames from FrameStreamer's; one lock covers the socket and the episode state."""
+
+    def __init__(self, host, port, meta, episode_dir=None):
+        import zmq
+
+        self.meta = {k: v for k, v in meta.items() if v is not None}
+        self.episode_dir = Path(episode_dir) if episode_dir else None
+        self.ctx = zmq.Context()
+        self.sock = self.ctx.socket(zmq.PUB)
+        self.sock.bind(f"tcp://{host}:{port}")  # raises zmq.ZMQError if the port is taken
+        self.lock = threading.Lock()
+        self.episode_id = None
+        self.started_mono = None
+        self.started_at = None
+        self.last_id = None
+        self.frames = []
+        self.writers = []  # background episode-file writes still running
+        self.frame_hz = None  # set by main() when frames are streamed
+        log.info("Episode publisher on tcp://%s:%s (task %r), saving to %s", host, port,
+                 self.meta.get("task"), self.episode_dir or "nowhere (--no-save)")
+
+    @property
+    def active(self):
+        return self.episode_id is not None
+
+    def _publish(self, topic, data):
+        self.sock.send_multipart([topic.encode(), json.dumps(data).encode()])
+
+    def handle(self, event):
+        """event from WholeBodyTeleop: "start_or_success" | "fail" | None."""
+        if event == "start_or_success":
+            if self.active:
+                self.end(success=True)
+            else:
+                self.start()
+        elif event == "fail":
+            if self.active:
+                self.end(success=False)
+            else:
+                log.info("Episode: left stick click ignored (no episode open)")
+
+    def start(self):
+        episode_id = datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
+        with self.lock:
+            if episode_id == self.last_id:
+                log.warning("Episode NOT started: %s was just used (pressed twice within a second?)", episode_id)
+                return
+            self.episode_id = self.last_id = episode_id
+            self.started_mono = time.monotonic()
+            self.started_at = time.time()
+            self.frames = []
+            self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": self.started_at, "active": True,
+                                                 "episode_id": episode_id, **self.meta})
+        log.info("Episode STARTED %s (task %r)", episode_id, self.meta.get("task"))
+
+    def add_frame(self, frame):
+        """FrameStreamer: stamp, publish and keep one frame. False if no episode is open."""
+        with self.lock:
+            if not self.active:
+                return False
+            frame["episode_id"] = self.episode_id
+            frame["seq"] = len(self.frames)
+            frame["active"] = True
+            self._publish(EPISODE_FRAME_TOPIC, frame)
+            self.frames.append(frame)
+            return True
+
+    def end(self, success):
+        with self.lock:
+            if not self.active:
+                return
+            now = time.time()
+            episode_id, frames, duration = self.episode_id, self.frames, time.monotonic() - self.started_mono
+            meta = {**self.meta, "episode_id": episode_id, "success": bool(success),
+                    "started_at": self.started_at, "ended_at": now, "num_frames": len(frames),
+                    "frame_hz": self.frame_hz}
+            self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": now, "active": False, "success": bool(success),
+                                                 "episode_id": episode_id, "num_frames": len(frames)})
+            self._publish(EPISODE_RESULT_TOPIC, {"timestamp": now, "result": "success" if success else "fail",
+                                                 "episode_id": episode_id})
+            self.episode_id = None
+            self.started_mono = None
+            self.frames = []
+        log.info("Episode ENDED %s -- %s (%.1f s, %d frames)", episode_id, "success" if success else "FAIL",
+                 duration, len(frames))
+        if self.episode_dir is not None:
+            # Compressing takes ~0.1 s per minute of episode: off the control thread.
+            t = threading.Thread(target=self._save, args=(episode_id, meta, frames), daemon=False)
+            t.start()
+            self.writers = [w for w in self.writers if w.is_alive()] + [t]
+
+    def _save(self, episode_id, meta, frames):
+        import episode_store
+
+        path = self.episode_dir / f"{episode_id}.yep"
+        try:
+            size = episode_store.write_episode(path, meta, frames, FRAME_FIELDS)
+            log.info("Episode saved %s (%d frames, %.1f kB)", path, len(frames), size / 1e3)
+        except Exception as e:  # noqa: BLE001 -- the Orin still has the stream
+            log.error("Episode %s NOT saved to %s: %s", episode_id, path, e)
+
+    def hud(self):
+        """teleop_state.recording for the headset HUD (static/main.js)."""
+        with self.lock:
+            if not self.active:
+                return {"active": False}
+            return {"active": True, "episode": self.episode_id, "task": self.meta.get("task"),
+                    "elapsed_s": round(time.monotonic() - self.started_mono, 1), "frames": len(self.frames)}
+
+    def close(self):
+        if self.active:
+            log.warning("Episode %s still open at exit: ending it as a fail", self.episode_id)
+            self.end(success=False)
+        for w in self.writers:
+            w.join()  # finish writing episode files before exit
+        self.sock.close(linger=500)  # give the end signal time to go out
+        self.ctx.term()
+
+
+class FrameStreamer:
+    """While an episode is open, samples yor.py's get_collection_state() (+ lift height) at
+    --frame-hz on its own RPC connection, adds what the teleop was commanding, and hands each
+    frame to EpisodePublisher. The robot state comes from yor.py, so frames record whatever is
+    driving the robot -- teleop or a policy."""
+
+    def __init__(self, runner, episodes, rate_hz, rpc_host=None, rpc_port=None, use_lift=True):
+        self.runner, self.episodes = runner, episodes
+        self.period = 1.0 / rate_hz
+        self.rpc_addr = None if rpc_host is None else (rpc_host, rpc_port)
+        self.use_lift = use_lift
+        self.rpc = None
+        self.stop = threading.Event()
+        self.late = 0  # frames that started more than one period late
+        self.failed = 0
+
+    def _rpc(self, name):
+        from commlink import RPCClient
+
+        if self.rpc is None:
+            self.rpc = RPCClient(*self.rpc_addr)
+        try:
+            return _call_with_timeout(lambda: getattr(self.rpc, name)(), 0.5)
+        except TimeoutError:
+            self.rpc = None  # a REQ socket left waiting can't be reused: reconnect next time
+            raise
+
+    def _sample(self):
+        if self.rpc_addr is None:  # --dry-run
+            s = {"timestamp": time.time(), "base_cmd_vel": [0.0, 0.0, 0.0], "enc_vel": [0.0, 0.0, 0.0],
+                 "neck_deg": FAKE_STATE["neck_deg"], "neck_cmd_deg": None, "lift_height": FAKE_STATE["lift_height"],
+                 "lift_cmd": 0.0}
+            for side in SIDES:
+                s[f"{side}_ee"] = FAKE_STATE[f"{side}_ee"]
+                s.update({f"{side}_joints": [0.0] * 7, f"{side}_joints_cmd": None, f"{side}_gripper": None,
+                          f"{side}_gripper_cmd": None, f"{side}_ik_ok": None})
+            return s
+        s = dict(self._rpc("get_collection_state"))
+        s["lift_height"] = self._rpc("get_lift_height") if self.use_lift else None
+        return s
+
+    def _frame(self, s, cmds):
+        """vr_teleop.py's teleop/episode frame keys, so existing collectors keep working, plus
+        neck, lift and teleop_on. episode_id / seq / active are added by EpisodePublisher."""
+        base = s.get("base_cmd_vel")
+        f = {"timestamp": s["timestamp"], "base_vel": base, "cmd_vel": base, "enc_vel": s.get("enc_vel"),
+             "teleop_on": bool(cmds and cmds["enabled"]), "neck_deg": s.get("neck_deg"),
+             "neck_cmd_deg": s.get("neck_cmd_deg"), "lift_height": s.get("lift_height"),
+             "lift_cmd": s.get("lift_cmd")}
+        for side in SIDES:
+            measured, commanded = s.get(f"{side}_gripper"), s.get(f"{side}_gripper_cmd")
+            arm = (cmds or {}).get("arms", {}).get(side) or {}
+            f[f"{side}_ee"] = s.get(f"{side}_ee")
+            f[f"{side}_joints"] = s.get(f"{side}_joints")
+            f[f"{side}_joints_cmd"] = s.get(f"{side}_joints_cmd")
+            f[f"{side}_gripper"] = measured if measured is not None else commanded
+            f[f"{side}_gripper_measured"] = measured is not None
+            f[f"{side}_gripper_cmd"] = commanded
+            target = arm.get("target")
+            f[f"{side}_ee_target"] = [float(x) for x in target] if target is not None else s.get(f"{side}_ee")
+            f[f"{side}_ik_ok"] = s.get(f"{side}_ik_ok")
+        # The ZED base pose lives on the Orin; it can join it there by timestamp.
+        f.update(base_pose=None, cam_pose=None, zed_timestamp=None, zed_age_s=None)
+        return f
+
+    def run(self):
+        next_t = time.monotonic()
+        while not self.stop.is_set():
+            if not self.episodes.active:
+                time.sleep(0.01)
+                next_t = time.monotonic()
+                continue
+            try:
+                s = self._sample()
+            except Exception as e:  # noqa: BLE001 -- skip this frame, keep the episode going
+                self.failed += 1
+                if self.failed in (1, 10) or self.failed % 300 == 0:
+                    log.warning("Episode frame: yor.py state read failed (%d so far): %s", self.failed, e or "timeout")
+                s = None
+            if s is not None:
+                with self.runner.lock:
+                    cmds = self.runner.last_commands
+                self.episodes.add_frame(self._frame(s, cmds))
+            next_t += self.period
+            delay = next_t - time.monotonic()
+            if delay < -self.period:
+                self.late += 1
+                next_t = time.monotonic()  # fell behind: re-anchor instead of bursting to catch up
+            else:
+                time.sleep(max(0.0, delay))
+
+
+def load_episode_meta(args):
+    meta = {}
+    if args.meta_file:
+        meta.update(json.loads(Path(args.meta_file).read_text()))
+    for key in ("task", "operator", "notes"):
+        if getattr(args, key) is not None:
+            meta[key] = getattr(args, key)
+    return meta
+
+
 # ------------------------------------------------------------------- runtime
 class Runner:
-    def __init__(self, rate_hz, print_period_s, cfg, link=None):
+    def __init__(self, rate_hz, print_period_s, cfg, link=None, episodes=None):
         self.rate_hz = rate_hz
         self.print_period_s = print_period_s
         self.teleop = WholeBodyTeleop(cfg)
         self.link = link
+        self.episodes = episodes
+        self.last_commands = None  # for FrameStreamer
         self.lock = threading.Lock()
         self.latest = None  # (payload, monotonic receive time)
         self.rx_times = []
@@ -518,7 +776,14 @@ class Runner:
                 latest = self.latest
                 fresh = latest is not None and t0 - latest[1] <= STALE_S
                 commands = self.teleop.update(latest[0] if fresh else None, robot_state, t0)
+                if self.episodes is not None:
+                    self.episodes.handle(commands["episode"])
+                elif commands["episode"]:
+                    log.info("Episode button ignored: episode publishing is off")
+                self.last_commands = commands
                 status = self.teleop.status()
+                if self.episodes is not None:
+                    status["recording"] = self.episodes.hud()
                 if self.link is not None and self.link.homing:
                     status["state"] = "HOMING"
                 status["robot"] = robot_hud
@@ -537,6 +802,8 @@ class Runner:
                 next_print = t0 + self.print_period_s
                 print(self.format_line(latest, fresh, commands, rx_hz, clients, robot_state), flush=True)
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
+        if self.episodes is not None:
+            self.episodes.close()
 
     # --- printing ---
     @staticmethod
@@ -567,6 +834,8 @@ class Runner:
                  self._ctrl_str("L", payload.get("left")), self._ctrl_str("R", payload.get("right"))]
 
         out = [f"=> {self.status['state']}"]
+        if self.episodes is not None and self.episodes.active:
+            out.append(f"REC {self.episodes.episode_id}")
         for side in SIDES:
             a = commands["arms"][side]
             anchor = robot_state.get(f"{side}_ee")
@@ -584,9 +853,11 @@ class Runner:
         return " | ".join(parts) + "\n    " + "  ".join(out) + link
 
 
-def main(default_video=DEFAULT_VIDEO, neck_calib=None):
+def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPISODE_HOST,
+         episode_port=DEFAULT_EPISODE_PORT, episode_dir="episodes"):
     """default_video / neck_calib: the YOR launcher passes the Orin address and
-    robot/neck/neck_calibration.json (its "home_deg" is the neck's straight-ahead)."""
+    robot/neck/neck_calibration.json (its "home_deg" is the neck's straight-ahead).
+    episode_host / episode_port: where the episode signals are published."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="don't connect to the robot; print commands only")
     parser.add_argument("--no-arms", action="store_true", help="don't drive the arms")
@@ -621,6 +892,19 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None):
     parser.add_argument("--neck-calib", default=neck_calib,
                         help="neck_calibration.json; its home_deg is straight ahead (default: 0, 0)")
     parser.add_argument("--no-video", action="store_true", help="don't point the headset at a video server")
+    ep = parser.add_argument_group("episodes (stick clicks -> episode/signal for the Orin collector)")
+    ep.add_argument("--no-episodes", action="store_true", help="don't publish episode signals or frames")
+    ep.add_argument("--frame-hz", type=float, default=FRAME_HZ_DEFAULT,
+                    help="episode frame rate to the Orin and to disk; 0 = signals only (default %(default)s)")
+    ep.add_argument("--episode-dir", default=episode_dir,
+                    help="where each episode is saved as <episode_id>.yep (default %(default)s)")
+    ep.add_argument("--no-save", action="store_true", help="stream frames to the Orin but don't save them here")
+    ep.add_argument("--episode-host", default=episode_host, help="interface to bind (default %(default)s)")
+    ep.add_argument("--episode-port", type=int, default=episode_port, help="ZMQ PUB port (default %(default)s)")
+    ep.add_argument("--task", help="language instruction, sent with each episode start")
+    ep.add_argument("--operator", help="who is operating")
+    ep.add_argument("--notes", help="free-form notes")
+    ep.add_argument("--meta-file", help="JSON file of extra episode metadata; the flags above override it")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -652,8 +936,29 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None):
             cfg.neck_tilt_offset_deg = link.neck_home["tilt"]
         threading.Thread(target=link.run, daemon=True).start()
 
-    runner = Runner(args.rate, args.print_period, cfg, link)
-    threading.Thread(target=runner.control_loop, daemon=True).start()
+    episodes = None
+    if not args.no_episodes:
+        import zmq
+
+        try:
+            save_dir = None if (args.no_save or args.frame_hz <= 0) else args.episode_dir
+            episodes = EpisodePublisher(args.episode_host, args.episode_port, load_episode_meta(args), save_dir)
+        except zmq.ZMQError as e:
+            log.error("Episode publisher NOT started (port %s: %s) -- is vr_teleop.py still running? "
+                      "Stick clicks will do nothing.", args.episode_port, e)
+        if episodes is not None and not episodes.meta.get("task"):
+            log.warning("No --task given: episode starts will carry no task prompt")
+
+    runner = Runner(args.rate, args.print_period, cfg, link, episodes)
+    control = threading.Thread(target=runner.control_loop, daemon=True)
+    control.start()
+    frames = None
+    if episodes is not None and args.frame_hz > 0:
+        frames = FrameStreamer(runner, episodes, args.frame_hz,
+                               rpc_host=None if args.dry_run else args.rpc_host, rpc_port=args.rpc_port,
+                               use_lift=not args.no_lift)
+        episodes.frame_hz = args.frame_hz
+        threading.Thread(target=frames.run, daemon=True).start()
 
     ips = [ip for ip in lan_ips() if ip.startswith("192.168.")] or lan_ips() or ["<pi-ip>"]
     video = None if args.no_video else args.video
@@ -666,10 +971,13 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None):
         vr_server.run(runner.on_payload, runner.on_connect, runner.on_disconnect, cameras=False,
                       default_video=video, port=args.port)
     finally:
+        if frames is not None:
+            frames.stop.set()
         runner.stop.set()
         if link is not None:
             link.stop.set()
-            time.sleep(0.2)  # let the link send a final base stop
+        control.join(timeout=5.0)  # it closes the episode publisher: ends + saves an open episode
+        time.sleep(0.3)  # let the link send a final base stop
 
 
 if __name__ == "__main__":

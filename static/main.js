@@ -209,9 +209,9 @@ const HEAD_SCREEN_OFFSET = new THREE.Vector3(0, -0.05, -1.2);
 // layer 2 only. Each plane is centred in front of its eye (planes ipd apart),
 // sized from the ZED calibration so the view is true scale in angle: an object
 // at infinity (zero disparity) lands straight ahead of each eye.
-// IPD: right stick up/down adjusts it (not in base mode), right stick click
-// resets to the headset's own measured IPD; remembered on this headset;
-// ?ipd=<mm> in the URL sets it.
+// IPD: right stick up/down adjusts it (not in base mode); starts at the
+// headset's own measured IPD; remembered on this headset; ?ipd=<mm> in the
+// URL sets it. (Right stick click is the episode start/stop button.)
 const STEREO_STREAM_ID = 3;
 const STEREO_DISTANCE = 3.0; // m; any distance works -- angular size is what's matched
 const IPD_MIN_MM = 40;
@@ -312,13 +312,9 @@ function setIpd(mm, show = true) {
   }, 500);
 }
 
-let prevIpdReset = false;
 function updateIpdFromStick(rightGamepad, dtS) {
   if (!rightGamepad) return;
   const inBaseMode = !!(lastTeleopState && String(lastTeleopState.state).includes("BASE"));
-  const reset = !!(rightGamepad.buttons[3] && rightGamepad.buttons[3].pressed);
-  if (reset && !prevIpdReset && measuredIpdMm !== null) setIpd(measuredIpdMm);
-  prevIpdReset = reset;
   if (inBaseMode) return;
   const y = rightGamepad.axes.length >= 4 ? rightGamepad.axes[3] : 0;
   if (Math.abs(y) < 0.3) return;
@@ -780,16 +776,60 @@ function updateHud(now) {
   alertPanel.red = model.alerts.some((a) => a[1] === "red");
 }
 
+const hudOffset = new THREE.Vector3();
 function placeHud(headPos, headQuat, now) {
   updateHud(now);
   alertPanel.mesh.material.opacity = alertPanel.red ? 0.6 + 0.4 * Math.abs(Math.sin(now * 0.005)) : 1;
   for (const p of hudPanels) {
-    headLock(p.mesh, p.offset, headPos, headQuat);
+    hudOffset.copy(p.offset);
+    hudOffset.y += hudYOffsetM;
+    headLock(p.mesh, hudOffset, headPos, headQuat);
     p.mesh.quaternion.multiply(p.turn);
   }
 }
 
 let lastTeleopState = null;
+
+// ---------- HUD height ----------
+// Left stick up/down moves the whole HUD up/down, only while teleop is OFF (or before
+// the robot link is up): with teleop on the left stick drives the base. Remembered on
+// this headset; ?hud_y=<m> in the URL sets it.
+const HUD_Y_STORAGE_KEY = "vrteleop.hud_y_m";
+const HUD_Y_LIMIT_M = 0.6;
+const HUD_Y_RATE_M_S = 0.3; // at full deflection
+let hudYOffsetM = 0;
+let hudYSaveTimer = null;
+{
+  const fromUrl = parseFloat(new URLSearchParams(location.search).get("hud_y"));
+  let stored = NaN;
+  try {
+    stored = parseFloat(localStorage.getItem(HUD_Y_STORAGE_KEY));
+  } catch (e) {
+    // storage unavailable: start centred
+  }
+  if (Number.isFinite(fromUrl)) hudYOffsetM = fromUrl;
+  else if (Number.isFinite(stored)) hudYOffsetM = stored;
+  hudYOffsetM = Math.min(HUD_Y_LIMIT_M, Math.max(-HUD_Y_LIMIT_M, hudYOffsetM));
+}
+
+function updateHudYFromStick(leftGamepad, dtS) {
+  if (!leftGamepad) return;
+  if (lastTeleopState && lastTeleopState.enabled) return; // teleop on: the stick is the base's
+  const y = leftGamepad.axes.length >= 4 ? leftGamepad.axes[3] : 0;
+  if (Math.abs(y) < 0.3) return;
+  // stick forward (y < 0) -> HUD up
+  const v = (Math.abs(y) - 0.3) / 0.7;
+  hudYOffsetM = Math.min(HUD_Y_LIMIT_M, Math.max(-HUD_Y_LIMIT_M,
+    hudYOffsetM - Math.sign(y) * v * HUD_Y_RATE_M_S * dtS));
+  clearTimeout(hudYSaveTimer);
+  hudYSaveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(HUD_Y_STORAGE_KEY, hudYOffsetM.toFixed(3));
+    } catch (e) {
+      // not persisted; still applies for this session
+    }
+  }, 500);
+}
 
 function handleTeleopState(msg) {
   const prevEnabled = lastTeleopState ? lastTeleopState.arm_enabled : { left: false, right: false };
@@ -883,7 +923,10 @@ renderer.setAnimationLoop((timestamp, frame) => {
       const pose = frame.getPose(space, refSpace);
       if (!pose) continue;
       const payload = { ...poseFromXRPose(pose), ...gamepadAxes(inputSource) };
-      if (inputSource.handedness === "left") leftPayload = payload;
+      if (inputSource.handedness === "left") {
+        leftPayload = payload;
+        updateHudYFromStick(inputSource.gamepad, dtS);
+      }
       if (inputSource.handedness === "right") {
         rightPayload = payload;
         updateIpdFromStick(inputSource.gamepad, dtS);

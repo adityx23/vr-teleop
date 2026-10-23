@@ -104,12 +104,22 @@ async def websocket_handler(request):
     return ws
 
 
+@web.middleware
+async def _no_cache(request, handler):
+    """Page + static files: make the headset browser revalidate every load, so an edited
+    main.js is picked up on a plain reload instead of an old cached copy running."""
+    resp = await handler(request)
+    if request.path == "/" or request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 def make_app(loop, on_payload, on_connect=None, on_disconnect=None, cameras=False, camera_config=None,
              default_video=None):
     """on_payload(payload_dict) -> status dict for the HUD (or None). Called on
     the event loop for every headset message, so it must not block. Pass
     on_payload=None for a video-only server."""
-    app = web.Application()
+    app = web.Application(middlewares=[_no_cache])
     app["streamer"] = None
     app["default_video"] = default_video
     app["counters"] = {"clients": 0}  # mutable: app state is frozen once started
