@@ -52,14 +52,17 @@ Periodic reads:
 |---|---|---|
 | `get_left_ee_pose()`, `get_right_ee_pose()`, `get_neck_position()` -> `{"pan", "tilt"}` | 10 Hz | measured state for the clutch anchors and neck |
 | `get_collection_state()` | 5 Hz (HUD only; failures just blank the HUD) | dict, see below |
-| `get_lift_height()` | 5 Hz (HUD only) | metres, or `None` |
+| `get_lift_height()` | 5 Hz (HUD only; only if `get_collection_state()` has no `lift_height`) | metres, or `None` |
 
 `get_collection_state()` keys the HUD reads: `neck_deg` `[pan, tilt]`,
 `{left,right}_gripper` (measured opening, `None` when feedback drops),
 `{left,right}_gripper_cmd` (commanded opening, `None` while limp),
 `{left,right}_gripper_error` (`None` while the measurement is live, else why it isn't;
 the bridge never fills one gripper value in from the other), `{left,right}_ik_ok` (last IK solve
-converged, or `None` if never asked), `base_cmd_vel` `[vx, vy, wz]`.
+converged, or `None` if never asked), `base_cmd_vel` `[vx, vy, wz]`, `lift_height` (metres,
+`None` when the Pico reading drops), `lift_height_error` (`None` while it is live, else why),
+`lift_homed` (`lift_height` is travel above the bottom stop), `lift_ref` (`"bottom_hard_stop"` /
+`"pico_power_on"`) and `lift_homing` (`lift_home` is running). See EPISODE_FORMAT.md, "Lift height".
 (The robot also returns `timestamp`, `enc_vel`, `neck_cmd_deg`, `{side}_ee`,
 `{side}_joints`, `{side}_joints_cmd`; the bridge ignores them.)
 
@@ -74,15 +77,21 @@ IK configuration is re-synced to the measured joints. The lift joint is pinned
 at 0 inside IK. After 10 consecutive failed solves the arm holds its last
 converged command instead of sending the unconverged one.
 
-## Lift travel (unresolved)
+## Lift travel
+- Robot: travel is 0 .. 0.6726 m from the bottom hard stop to the top stop (measured
+  2026-10-23). The reading means that only once the lift is homed (`lift_homed`;
+  EPISODE_FORMAT.md, "Lift height"). `lift_home()` starts homing and returns at once;
+  `get_lift_status()` -> `{homed, ref, homing, home_error}`. `yor.py` clamps
+  `lift_to_height` / `set_lift_position` to `LIFT_MIN_M`..`LIFT_MAX_M` (0..0.66 m) and
+  refuses them while the lift is not homed. The HUD bar and `lift_retarget.py`'s
+  `min_h`/`max_h` use the same range.
 - IK model: `lift_joint` range 0..0.208 m; the `Lift` actuator uses
   `inheritrange`, so 0..0.208 as well. The `telescope` default class's ctrlrange
   0..0.416 is a leftover from the old two-stage `robot.mjcf` (see the comment in
-  the MJCF); models built from it may still carry the wrong range.
-- Robot: the Pico lift reports height in mm; `yor.py` clamps `lift_to_height`
-  to 0..0.5 m, and the HUD assumes 0..0.5. Real travel is not yet measured.
-- `lift_retarget.py` `LiftConfig` (0..0.20, reach band 0.75..1.05 m) is
-  unverified; its automatic retargeting is off on the robot.
+  the MJCF); models built from it may still carry the wrong range. The model does not
+  match the real lift.
+- `lift_retarget.py`'s reach band (0.75..1.05 m) is unverified; its automatic
+  retargeting is off on the robot.
 
 ## Hardware differences to keep in mind
 - The gripper calls go to the arms in `--gripper-sides` (default both). Stock

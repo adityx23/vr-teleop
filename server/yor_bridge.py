@@ -49,7 +49,10 @@ the same format robot/teleop/vr_teleop.py uses (full field reference: docs/EPISO
                           None while limp -- neither is ever filled in from the other;
                           {side}_ee_target = the teleop's target pose, None with
                           {side}_ee_target_error when there is none, never the measured pose)
-                          neck_cmd_deg, lift_height, lift_cmd (+1 up/-1 down/0), teleop_on. Read from yor.py, so it records
+                          neck_cmd_deg, lift_height, lift_cmd (+1 up/-1 down/0), teleop_on,
+                          lift_homed / lift_ref (lift_height is travel above the bottom stop only
+                          when lift_homed; an episode started without it logs a warning and the HUD
+                          shows LIFT NOT HOMED). Read from yor.py, so it records
                           whatever drives the robot (teleop or a policy). ZED pose fields are
                           None: the Orin has the ZED and can join it by timestamp.
 Each episode is also saved here as --episode-dir/<episode_id>.yep, compressed to a few
@@ -96,10 +99,10 @@ EPISODE_FRAME_TOPIC = "teleop/episode"
 FRAME_HZ_DEFAULT = 30.0
 # Saved per frame in the Pi-side .yep file (everything numeric in a frame).
 FRAME_FIELDS = ["timestamp", "teleop_on", "base_vel", "enc_vel", "neck_deg", "neck_cmd_deg", "lift_height",
-                "lift_cmd"] + [
+                "lift_cmd", "lift_homed"] + [
     f"{side}_{k}" for side in ("left", "right") for k in
     ("ee", "joints", "joints_cmd", "gripper", "gripper_cmd", "ee_target", "ik_ok")]
-ERROR_FIELDS = [f"{side}_{k}_error" for side in ("left", "right")
+ERROR_FIELDS = ["lift_height_error"] + [f"{side}_{k}_error" for side in ("left", "right")
                 for k in ("gripper", "ee_target")]  # str | None; saved as changes
 
 log = logging.getLogger("whole_body_teleop")
@@ -129,7 +132,7 @@ FAKE_HUD = {
     "dry_run": True, "rpc_ok": True, "error": None, "homing": False,
     "neck": {"pan": 0.0, "tilt": 0.0, "pan_lim": [-60.0, 60.0], "tilt_lim": [-30.0, 30.0]},
     "gripper": {"left": 0.6, "right": 0.6}, "ik_ok": {"left": True, "right": True},
-    "lift": {"height": 0.10, "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1]},
+    "lift": {"height": 0.10, "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1], "homed": True, "homing": False},
     "base_vel": [0.0, 0.0, 0.0],
 }
 
@@ -368,8 +371,10 @@ class RobotLink:
             hud["neck"] = None
         vel = cs.get("base_cmd_vel")
         hud["base_vel"] = None if vel is None else [float(v) for v in vel]
-        h = self._quiet_call("get_lift_height")
-        hud["lift"] = None if h is None else {"height": float(h), "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1]}
+        h = cs.get("lift_height") if "lift_height" in cs else self._quiet_call("get_lift_height")
+        hud["lift"] = None if h is None else {"height": float(h), "min": LIFT_RANGE_M[0], "max": LIFT_RANGE_M[1],
+                                              "homed": bool(cs.get("lift_homed")),
+                                              "homing": bool(cs.get("lift_homing"))}
         with self.lock:
             self.hud_state = hud
             self.monitor_robot = {"state": cs or None, "lift_height": None if h is None else float(h),
@@ -682,6 +687,7 @@ class FrameStreamer:
         self.stop = threading.Event()
         self.late = 0  # frames that started more than one period late
         self.failed = 0
+        self.lift_checked = None  # episode whose lift homing was checked
 
     def _rpc(self, name):
         from commlink import RPCClient
@@ -698,7 +704,7 @@ class FrameStreamer:
         if self.rpc_addr is None:  # --dry-run
             s = {"timestamp": time.time(), "base_cmd_vel": [0.0, 0.0, 0.0], "enc_vel": [0.0, 0.0, 0.0],
                  "neck_deg": FAKE_STATE["neck_deg"], "neck_cmd_deg": None, "lift_height": FAKE_STATE["lift_height"],
-                 "lift_cmd": 0.0}
+                 "lift_height_error": None, "lift_cmd": 0.0, "lift_homed": True, "lift_ref": "dry_run"}
             for side in SIDES:
                 s[f"{side}_ee"] = FAKE_STATE[f"{side}_ee"]
                 s.update({f"{side}_joints": [0.0] * 7, f"{side}_joints_cmd": None, f"{side}_gripper": None,
@@ -706,7 +712,9 @@ class FrameStreamer:
                           f"{side}_ik_ok": None})
             return s
         s = dict(self._rpc("get_collection_state"))
-        s["lift_height"] = self._rpc("get_lift_height") if self.use_lift else None
+        if "lift_height" not in s:  # older yor.py: height only via its own call, no error field
+            s["lift_height"] = self._rpc("get_lift_height")
+            s["lift_height_error"] = None if s["lift_height"] is not None else "no lift height from yor.py"
         return s
 
     def _frame(self, s, cmds):
@@ -716,7 +724,8 @@ class FrameStreamer:
         f = {"timestamp": s["timestamp"], "base_vel": base, "cmd_vel": base, "enc_vel": s.get("enc_vel"),
              "teleop_on": bool(cmds and cmds["enabled"]), "neck_deg": s.get("neck_deg"),
              "neck_cmd_deg": s.get("neck_cmd_deg"), "lift_height": s.get("lift_height"),
-             "lift_cmd": s.get("lift_cmd")}
+             "lift_height_error": s.get("lift_height_error"), "lift_cmd": s.get("lift_cmd"),
+             "lift_homed": bool(s.get("lift_homed")), "lift_ref": s.get("lift_ref")}
         for side in SIDES:
             arm = (cmds or {}).get("arms", {}).get(side) or {}
             f[f"{side}_ee"] = s.get(f"{side}_ee")
@@ -756,7 +765,13 @@ class FrameStreamer:
             if s is not None:
                 with self.runner.lock:
                     cmds = self.runner.last_commands
-                self.episodes.add_frame(self._frame(s, cmds))
+                frame = self._frame(s, cmds)
+                if self.episodes.add_frame(frame) and frame["episode_id"] != self.lift_checked:
+                    self.lift_checked = frame["episode_id"]
+                    if self.use_lift and not frame["lift_homed"]:
+                        log.warning("Episode %s: lift NOT homed: lift_height is relative to where the Pico "
+                                    "powered on (lift_ref %r), not the bottom stop. Home it between episodes: "
+                                    "python robot/lift_home.py", frame["episode_id"], frame["lift_ref"])
             next_t += self.period
             delay = next_t - time.monotonic()
             if delay < -self.period:

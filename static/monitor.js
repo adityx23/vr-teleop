@@ -84,9 +84,13 @@ function renderLiftNeck(m) {
   const lc = st.lift_cmd;
   const manual = m.commands?.lift_manual;
   const lcText = lc === 1 ? "↑ up" : lc === -1 ? "↓ down" : lc === 0 ? "stop" : "—";
-  $("lift").innerHTML = `<span>Lift height</span><span>${h === null || h === undefined ? "— (no reading)" : `${fmt(h, 3)} m`}</span>
-    <span>Lift command</span><span style="color:var(--cmd)">${lcText}${manual ? ` (VR: ${esc(manual)})` : ""}</span>`;
-  const max = 0.66;
+  const herr = st.lift_height_error;
+  $("lift").innerHTML = `<span>Lift height</span><span>${h === null || h === undefined
+      ? `<span class="err">${esc(herr || "no reading")}</span>` : `${fmt(h, 3)} m`}</span>
+    <span>Lift command</span><span style="color:var(--cmd)">${lcText}${manual ? ` (VR: ${esc(manual)})` : ""}</span>
+    <span>Lift reference</span><span>${st.lift_homed ? esc(st.lift_ref || "") : `<span class="err">NOT homed${
+      st.lift_homing ? " (homing…)" : ""}: relative to ${esc(st.lift_ref || "?")}</span>`}</span>`;
+  const max = 0.6726;
   $("lift-bar").firstElementChild.style.width = `${h ? Math.min(100, (h / max) * 100) : 0}%`;
   const n = st.neck_deg;
   const nc = st.neck_cmd_deg;
@@ -144,6 +148,8 @@ function renderAlerts(m) {
     const e = st[`${side}_gripper_error`];
     if (e && m.link?.gripper_sides?.includes(side)) out.push(`${side} gripper: ${e}`);
   }
+  if (st.lift_height_error) out.push(`lift: ${st.lift_height_error}`);
+  if (st.lift_height !== undefined && !st.lift_homed) out.push("lift: NOT homed (run python robot/lift_home.py)");
   for (const w of m.teleop?.warnings || []) out.push(`teleop: ${w}`);
   const el = $("alerts");
   el.style.display = out.length ? "block" : "none";

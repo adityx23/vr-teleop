@@ -35,6 +35,7 @@ why, and the error is `null` exactly when the value is present.
 | Value | Error partner | `null` means |
 |---|---|---|
 | `{side}_gripper` | `{side}_gripper_error` | no fresh gripper feedback (CAN 0x2A8 older than 0.25 s, not being read, or no gripper) |
+| `lift_height` | `lift_height_error` | no fresh Pico height (reply older than 0.5 s, no reply, serial not open, or `YOR_LIFT=0`) |
 | `{side}_ee_target` | `{side}_ee_target_error` | no teleop target: `"no teleop commands yet"`, `"teleop off"`, `"{side} arm not clutched"` |
 | `{side}_gripper_cmd` | (none) | gripper is limp: nothing is being commanded |
 
@@ -56,14 +57,45 @@ why, and the error is `null` exactly when the value is present.
 | `{side}_gripper_error` | str \| null | see above | |
 | `base_vel`, `cmd_vel` | float[3] | `[vx, vy, wz]`, m/s and rad/s, base frame (same value twice, for old collectors) | commanded |
 | `enc_vel` | float[3] \| null | `[vx, vy, wz]` from swerve FK on the wheel encoders | measured |
-| `lift_height` | float \| null | m | measured |
+| `lift_height` | float \| null | m, carriage travel above the bottom stop when `lift_homed` (see [Lift height](#lift-height)); polled from the Pico at 50 Hz | measured |
+| `lift_height_error` | str \| null | see above | |
+| `lift_homed` | bool | `lift_height` is absolute: the lift was zeroed at the bottom stop since the Pico last powered on | |
+| `lift_ref` | str \| null | what `lift_height` is measured from: `"bottom_hard_stop"` (homed) or `"pico_power_on"` (not homed); `null` with no lift or an older `yor.py` | |
 | `lift_cmd` | int | last manual lift command: +1 up, -1 down, 0 stop | commanded |
 | `neck_deg` | float[2] \| null | `[pan, tilt]`, deg | measured |
 | `neck_cmd_deg` | float[2] \| null | `[pan, tilt]` goal, deg | commanded |
 | `base_pose`, `cam_pose`, `zed_timestamp`, `zed_age_s` | null | always `null` here: the Orin has the ZED and joins it by timestamp | |
 
-`enc_vel`, `lift_height`, `neck_deg` and `{side}_ee` have no `_error` partner yet: `null`
+`enc_vel`, `neck_deg` and `{side}_ee` have no `_error` partner yet: `null`
 there means the read failed.
+
+### Lift height
+
+`lift_height` = carriage travel in metres above the fully-down reference: **0 = fully down
+(the bottom hard stop), increasing upward**. Measured travel: **0 .. 0.6726 m** (bottom stop to
+top stop, 2026-10-23). Floor (and robot base frame) to the carriage at travel 0: TBD (not measured yet), so absolute
+height = offset + `lift_height`.
+
+The lift has an incremental encoder and no limit switches. The Pico zeroes it wherever the
+carriage is at power-on, so on its own the reading moves between sessions (e.g. 2026-10-26
+data starting at 0.000 and going to -0.33 m). The only fixed reference is the bottom hard
+stop. When the carriage stalls there while driving down, the Pico re-zeroes the height. That
+happens on `python robot/lift_home.py` (`lift_home` RPC), and also on any manual drive down
+until the lift stops. From then on the reading is absolute and `lift_homed` is `true`. It
+stays `true` across `yor.py` and bridge restarts. It goes back to `false` after a Pico reset,
+power cycle or USB re-plug, and after a down-stall more than 10 mm above the bottom stop (an
+obstruction: the Pico then re-zeroed in the wrong place).
+
+When `lift_homed` is `false`, `lift_height` is still the raw reading, relative to the
+Pico's power-on position (`lift_ref: "pico_power_on"`). It can be negative. Don't combine
+it with homed data. Nothing is ever fabricated or shifted on the Pi. The lift is never
+homed automatically, because driving it down at startup could put the arms into whatever is
+below them. Instead, an episode started while it isn't homed logs a warning on the Pi, and
+the headset HUD shows LIFT NOT HOMED (red while recording).
+
+Repeatability: the Pico counts encoder ticks only while it drives the motor, so slip or
+coast after a stop is not counted. Each re-zero logs the drift it corrected ("drift since
+the last home: +x mm") on the `yor.py` console.
 
 ## Pi-side copy (`.yep`)
 
@@ -72,6 +104,8 @@ The bridge also saves each episode as `<episode-dir>/<episode_id>.yep` (YOR:
 `(meta, data)`, where `data[field]` is a `(T, width)` float array.
 
 - Missing values are `NaN` (the file keeps a per-field mask).
+- `lift_homed` is stored per frame (1/0). `lift_ref` is not; it is `"bottom_hard_stop"`
+  exactly when `lift_homed`.
 - Error strings are not stored per frame. `meta["errors"]` is a list of
   `{seq, field, error}`, one entry each time an `_error` field changes; `error: null`
   means the signal came back at that `seq`.

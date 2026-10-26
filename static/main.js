@@ -563,6 +563,11 @@ function hudModel() {
     }
   }
   if (links.video && !videoOk()) alerts.push(["NO VIDEO", "amber"]);
+  // lift_height is only absolute (travel above the bottom stop) once the lift is homed
+  if (r && r.lift && r.lift.homed === false) {
+    const rec = s && s.recording && s.recording.active;
+    alerts.push([r.lift.homing ? "LIFT HOMING" : "LIFT NOT HOMED", rec ? "red" : "amber"]);
+  }
   return { s, r, alerts };
 }
 
