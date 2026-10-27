@@ -576,6 +576,7 @@ class EpisodePublisher:
         self.started_at = None
         self.last_id = None  # second (YYYY-MM-DD--HH-MM-SS) of the last episode start
         self.same_second = 1  # episodes started in that second (chained cycle episodes)
+        self.last_episode_id = None  # full id of the last episode started (with any -N suffix)
         self.frames = []
         self.errors = []  # [{seq, field, error}] each time an ERROR_FIELDS value changes
         self.writers = []  # background episode-file writes still running
@@ -638,7 +639,7 @@ class EpisodePublisher:
             if self.cycle is not None and self.cycle.active:
                 self.cycle.started()
                 self.episode_meta = self.cycle.episode_meta()
-            self.episode_id, self.last_id = episode_id, base
+            self.episode_id, self.last_id, self.last_episode_id = episode_id, base, episode_id
             self.started_mono = time.monotonic()
             self.started_at = time.time()
             self.frames = []
@@ -1009,7 +1010,7 @@ class Runner:
         }
         if self.episodes is not None:
             ep = self.episodes
-            out["episode"] = {**ep.hud(), "last_id": ep.last_id, "meta": ep.meta,
+            out["episode"] = {**ep.hud(), "last_id": ep.last_episode_id, "meta": ep.meta,
                               "errors": list(ep.errors[-20:]) if ep.active else [],
                               "frame_hz": ep.frame_hz}
             if self.frames is not None:

@@ -163,6 +163,8 @@ def test_success_chains_episodes_with_unique_ids_and_ignores_double_clicks():
         assert pub.episode_meta["cycle_lap"] == 1 and pub.episode_meta["subtask_attempt"] == 1
         pub.handle("fail")
         assert not pub.active
+        from datetime import datetime
+        pub.last_id = datetime.now().strftime("%Y-%m-%d--%H-%M-%S")  # as if the last start was this second
         pub.handle("start_or_success")  # a plain start in the same second is still refused
         assert not pub.active
         pub.last_id = None  # a second later
