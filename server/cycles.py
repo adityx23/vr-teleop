@@ -7,11 +7,13 @@ A cycle is a self-resetting list of subtasks, e.g. open fridge, grab soda, close
 open fridge, place soda, close fridge. Each subtask attempt is one episode:
 
   right click, no episode open   start an episode for the current subtask
-  right click, episode open      end it as a success; move on to the next subtask
-                                 (after the last one, back to the first: one more lap)
-  left click, episode open       end it as a fail; the next right click retries the same subtask
-  left click, no episode open    go back one subtask (fix a mis-click; right-click twice to
-                                 skip forward again -- that leaves a ~1 s "success" to filter out)
+  right click, episode open      end it as a success, move on to the next subtask and start
+                                 its episode at once (after the last one, back to the first:
+                                 one more lap); ignored in the first second of an episode
+  left click, episode open       end it as a fail and stop; the next right click retries the
+                                 same subtask (also the way to pause after a success)
+  left click, no episode open    go back one subtask (fix a mis-click; to skip forward, right
+                                 click, wait a second, right click: a ~1 s "success" to filter out)
 
 The current subtask is kept in a small JSON file keyed by the cycle's name and subtask list,
 so restarting the bridge or the collector mid-cycle resumes where the scene actually is.

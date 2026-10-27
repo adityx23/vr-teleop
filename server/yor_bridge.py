@@ -22,8 +22,9 @@ Teleop starts OFF. Controls:
   B + Y (one per hand)        base mode on/off;  left stick drive, right stick turn
   head                  neck pan/tilt; straight ahead re-zeroes each time teleop turns on
   right stick click     episode start / end as success;  left stick click  end as fail
-                        (in a cycle from the Orin: success moves to the next subtask; left click
-                        with no episode open goes back one subtask)
+                        (in a cycle from the Orin: success moves on and immediately starts the
+                        next subtask's episode; a fail stops, the next right click retries; left
+                        click with no episode open goes back one subtask)
   left stick (teleop off)  move the headset HUD up/down
   right stick up/down   IPD;  left/right (teleop off)  view tilt: the robot looks that much further
                         down (or up) than your head, so you don't crane your neck at a table
@@ -102,6 +103,9 @@ EPISODE_SIGNAL_TOPIC = "episode/signal"
 EPISODE_RESULT_TOPIC = "teleop/episode_result"
 EPISODE_FRAME_TOPIC = "teleop/episode"
 CYCLE_TOPIC = "collection/cycle"  # Orin -> Pi: which cycle of subtasks is being collected (cycles.py)
+# In a cycle, a right click ends the episode as a success and starts the next subtask at once.
+# A right click on an episode younger than this is ignored, so a double click can't skip a subtask.
+CYCLE_ADVANCE_MIN_S = 1.0
 DEFAULT_CYCLE_SOURCE = os.environ.get("CYCLE_SOURCE")  # Orin collector's host:port, e.g. 192.168.123.117:5559
 FRAME_HZ_DEFAULT = 30.0
 # Saved per frame in the Pi-side .yep file (everything numeric in a frame).
@@ -570,7 +574,8 @@ class EpisodePublisher:
         self.episode_id = None
         self.started_mono = None
         self.started_at = None
-        self.last_id = None
+        self.last_id = None  # second (YYYY-MM-DD--HH-MM-SS) of the last episode start
+        self.same_second = 1  # episodes started in that second (chained cycle episodes)
         self.frames = []
         self.errors = []  # [{seq, field, error}] each time an ERROR_FIELDS value changes
         self.writers = []  # background episode-file writes still running
@@ -586,12 +591,21 @@ class EpisodePublisher:
         self.sock.send_multipart([topic.encode(), json.dumps(data).encode()])
 
     def handle(self, event):
-        """event from WholeBodyTeleop: "start_or_success" | "fail" | None."""
+        """event from WholeBodyTeleop: "start_or_success" | "fail" | None.
+        In a cycle, a success chains straight into the next subtask's episode; a fail stops."""
         if event == "start_or_success":
-            if self.active:
-                self.end(success=True)
-            else:
+            if not self.active:
                 self.start()
+                return
+            with self.lock:
+                in_cycle = bool(self.episode_meta)  # this episode was started for a cycle subtask
+                age = time.monotonic() - self.started_mono
+            if in_cycle and age < CYCLE_ADVANCE_MIN_S:
+                log.info("Episode: right stick click %.2f s after the start ignored (double click?)", age)
+                return
+            self.end(success=True)
+            if in_cycle and self.cycle is not None and self.cycle.active:
+                self.start(chained=True)
         elif event == "fail":
             if self.active:
                 self.end(success=False)
@@ -606,17 +620,25 @@ class EpisodePublisher:
         with self.lock:
             self.cycle.announce(msg, time.monotonic(), episode_open=self.active)
 
-    def start(self):
-        episode_id = datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
+    def start(self, chained=False):
+        """chained: started by the same click that ended the previous cycle episode, so it may
+        fall in the same second; its id then gets a -2, -3, ... suffix."""
+        base = datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
         with self.lock:
-            if episode_id == self.last_id:
-                log.warning("Episode NOT started: %s was just used (pressed twice within a second?)", episode_id)
-                return
+            episode_id = base
+            if base == self.last_id:
+                if not chained:
+                    log.warning("Episode NOT started: %s was just used (pressed twice within a second?)", base)
+                    return
+                self.same_second += 1
+                episode_id = f"{base}-{self.same_second}"
+            else:
+                self.same_second = 1
             self.episode_meta = {}
             if self.cycle is not None and self.cycle.active:
                 self.cycle.started()
                 self.episode_meta = self.cycle.episode_meta()
-            self.episode_id = self.last_id = episode_id
+            self.episode_id, self.last_id = episode_id, base
             self.started_mono = time.monotonic()
             self.started_at = time.time()
             self.frames = []

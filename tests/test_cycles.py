@@ -122,16 +122,65 @@ def test_publisher_signals_carry_the_subtask():
         assert msg["cycle"] == "fridge_soda" and msg["subtask_index"] == 0 and msg["num_subtasks"] == 6
         assert msg["subtask_attempt"] == 1 and msg["operator"] == "t"
         assert pub.hud()["cycle"]["state"] == "rec"
-        pub.handle("start_or_success")  # success -> next subtask
+        pub.started_mono -= 5  # past the double-click guard
+        pub.handle("start_or_success")  # success -> next subtask, started at once
         _, end = recv()
         _, result = recv()
         assert not end["active"] and end["success"] and end["subtask_index"] == 0
         assert result["result"] == "success" and result["cycle"] == "fridge_soda"
-        assert pub.hud()["task"] == "grab the soda"
+        _, nxt = recv()
+        assert nxt["active"] and nxt["task"] == "grab the soda" and nxt["subtask_index"] == 1
+        assert pub.active and pub.hud()["task"] == "grab the soda"
+        pub.handle("fail")  # open: fail it and stop
+        _, end = recv()
+        recv()
+        assert not end["success"] and not pub.active and pub.hud()["task"] == "grab the soda"
         pub.handle("fail")  # nothing open: back one subtask
         assert pub.hud()["task"] == "open the fridge"
     finally:
         sub.close(linger=0)
+        pub.close()
+
+
+def test_success_chains_episodes_with_unique_ids_and_ignores_double_clicks():
+    from yor_bridge import EpisodePublisher
+
+    pub = EpisodePublisher("127.0.0.1", "*", {"task": "fallback"}, None, cycle=CycleTracker())
+    try:
+        pub.announce_cycle(FRIDGE)
+        pub.handle("start_or_success")
+        first = pub.episode_id
+        pub.handle("start_or_success")  # within a second of the start: ignored
+        assert pub.episode_id == first and pub.cycle.idx == 0
+        ids = [first]
+        for _ in range(6):  # a whole lap of successes, faster than one per second
+            pub.started_mono -= 5
+            pub.handle("start_or_success")
+            assert pub.active
+            ids.append(pub.episode_id)
+        assert len(set(ids)) == len(ids)  # same-second chained starts get -2, -3, ... suffixes
+        assert pub.cycle.idx == 0 and pub.cycle.lap == 1 and pub.episode_meta["subtask_index"] == 0
+        assert pub.episode_meta["cycle_lap"] == 1 and pub.episode_meta["subtask_attempt"] == 1
+        pub.handle("fail")
+        assert not pub.active
+        pub.handle("start_or_success")  # a plain start in the same second is still refused
+        assert not pub.active
+        pub.last_id = None  # a second later
+        pub.handle("start_or_success")  # retry the failed subtask
+        assert pub.active and pub.episode_meta["subtask_attempt"] == 2
+    finally:
+        pub.close()
+
+
+def test_task_mode_success_still_stops():
+    from yor_bridge import EpisodePublisher
+
+    pub = EpisodePublisher("127.0.0.1", "*", {"task": "fallback"}, None, cycle=CycleTracker())
+    try:
+        pub.handle("start_or_success")  # no cycle announced: --task episode
+        pub.handle("start_or_success")  # ends it at once (no guard outside a cycle)
+        assert not pub.active
+    finally:
         pub.close()
 
 

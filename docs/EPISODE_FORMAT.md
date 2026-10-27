@@ -16,7 +16,9 @@ ZMQ PUB, bound on the Pi at `*:5558` (`--episode-port`). Every message is two fr
 | `teleop/episode_result` | episode end | `{timestamp, result: "success" \| "fail", episode_id}` + `cycle`, `subtask_index` in a cycle |
 | `teleop/episode` | 30 Hz while an episode is open | one frame, below |
 
-`episode_id` is `YYYY-MM-DD--HH-MM-SS` (Pi local time at start). Frames are only sent
+`episode_id` is `YYYY-MM-DD--HH-MM-SS` (Pi local time at start); a cycle episode chained
+from the previous one within the same second gets a `-2`, `-3`, ... suffix. Treat it as an
+opaque string. Frames are only sent
 between a start and its end. Right stick click starts / ends as success, left stick click
 ends as fail, with teleop on or off (so policy rollouts can be marked too).
 
@@ -46,12 +48,15 @@ Clicks in a cycle:
 
 | Click | No episode open | Episode open |
 |---|---|---|
-| right | start the current subtask | end as success, move to the next subtask (wraps to the first: one more lap) |
-| left | go back one subtask | end as fail; the next right click retries the same subtask |
+| right | start the current subtask | end as success, move to the next subtask and **start its episode at once** (wraps to the first: one more lap); ignored in the episode's first second |
+| left | go back one subtask | end as fail and stop; the next right click retries the same subtask |
 
-So to pause, end a subtask as a success and leave the next one un-started (or start it and
-fail it; those short fails are kept and can be filtered out later, as can a ~1 s success
-from double-clicking forward after going back too far). A different cycle announced
+So a run of successes is back-to-back episodes: one episode's end signal and result are
+followed immediately by the next one's start (`timestamp`s microseconds apart). To pause,
+fail the episode that was just started (left click); those short fails are kept and can be
+filtered out later, as can a ~1 s success from skipping forward (right click, wait a second,
+right click) after going back too far. The first-second guard keeps a double click from
+skipping a subtask. A different cycle announced
 mid-episode takes effect when that episode ends. The current subtask is saved per cycle name
 in `teleop_data/cycle_state.json`, so a bridge or collector restart resumes where the scene
 is (same name and same subtask list; otherwise it starts at the first subtask).

@@ -77,9 +77,15 @@ right. It also carries:
 
 End messages (`episode/signal` with `active: false`, and `teleop/episode_result`) add
 `cycle` and `subtask_index`. Keep failed episodes and record their result, since they are useful
-for filtering. Very short episodes are expected: a fail started only to "pause", or a ~1 s
-success from clicking forward again after going back a subtask. Filter them out later
-(e.g. by `num_frames` or duration) rather than at collection time.
+for filtering. Very short episodes are expected: a fail started only to "pause" (a success
+starts the next subtask's episode at once, so pausing means failing that one), or a ~1 s
+success from skipping forward after going back a subtask. Filter them out later (e.g. by
+`num_frames` or duration) rather than at collection time.
+
+**Back-to-back episodes.** After a success the next episode's start signal follows the end
+signal and result immediately. The collector must handle that start right away, not after it
+has finished saving the previous episode, or it loses the new episode's first frames.
+`episode_id` may then carry a `-2` suffix (same second); treat it as opaque.
 
 Nothing else changes: frames still arrive on the Pi's `:5558`, keyed by `episode_id`.
 
