@@ -111,6 +111,17 @@ function renderEpisode(m) {
     ["Episode", esc(ep.episode || ep.last_id || "—") + (ep.active ? "" : ep.last_id ? " (last)" : "")],
     ["Task", esc(ep.task || ep.meta?.task || "— (no --task)")],
   ];
+  const cy = ep.cycle;
+  if (cy) {
+    const st = cy.state === "rec" ? `<b style="color:var(--bad)">recording</b>` : cy.state === "retry" ? "retry (last attempt failed)" : "ready";
+    kv.push(
+      ["Cycle", `${esc(cy.name)} — subtask ${cy.idx + 1}/${cy.n}, lap ${cy.lap}` +
+        (cy.stale ? ` <b style="color:var(--warn)">(collector not heard)</b>` : "")],
+      ["Subtask", `${esc(cy.subtask)} · ${st}${cy.attempt ? ` · attempt ${cy.attempt}` : ""}`],
+      ["Next", esc(cy.next)],
+    );
+    if (cy.pending) kv.push(["Switching to", `${esc(cy.pending)} after this episode`]);
+  }
   if (ep.active) kv.push(["Elapsed", `${fmt(ep.elapsed_s, 1)} s`], ["Frames", `${ep.frames} @ ${ep.frame_hz ?? "—"} Hz`]);
   if (ep.frames_late !== undefined) kv.push(["Late / failed reads", `${ep.frames_late} / ${ep.frames_failed}`]);
   $("episode").innerHTML = kv.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join("");

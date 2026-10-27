@@ -21,7 +21,10 @@ Controls (Quest Touch, WebXR "xr-standard" mapping):
   right stick click   episode: start, or end as success  (works with teleop off,
   left stick click    episode: end as fail                so it can mark policy rollouts)
   head                neck pan/tilt, always on; "straight ahead" is re-zeroed
-                      each time teleop turns on (so also after a home)
+                      each time teleop turns on (so also after a home). The payload's
+                      view_pitch_deg (right stick left/right on the headset, teleop off)
+                      is added to the head pitch, so the robot can look far down while
+                      you look straight ahead
   head height + arms  lift (whole-body retargeting, only while an arm is clutched)
 
 Frames:
@@ -92,6 +95,9 @@ class WholeBodyConfig:
     neck_tilt_offset_deg: float = 0.0  # neck tilt that points the camera at the horizon
     neck_limits_deg: dict = field(default_factory=lambda: {"pan": (-90.0, 90.0), "tilt": (-45.0, 45.0)})
     neck_max_speed_dps: float = 180.0
+    # headset view pitch (payload "view_pitch_deg", set on the headset with the right stick):
+    # added to the head's pitch, so with -30 the camera looks 30 deg further down than you do
+    view_pitch_limits_deg: tuple = (-60.0, 30.0)
     # lift
     lift: LiftConfig = field(default_factory=LiftConfig)
     # teleop on/off switch (A + X, one on each controller)
@@ -191,6 +197,7 @@ class WholeBodyTeleop:
         self._prev_stick_click = {side: False for side in SIDES}
         self._neck_yaw0 = None
         self.neck_cmd = None  # {"pan", "tilt"} degrees, last commanded
+        self.view_pitch_deg = 0.0  # last headset view pitch offset, deg (+ up)
         self.lift = LiftRetargeter(self.cfg.lift)
         self._last_now = None
         self.warnings = []
@@ -215,6 +222,9 @@ class WholeBodyTeleop:
         robot_state = robot_state or {}
 
         head = self._filtered("head", payload.get("head"))
+        vp = payload.get("view_pitch_deg")
+        if isinstance(vp, (int, float)) and math.isfinite(vp):
+            self.view_pitch_deg = float(np.clip(vp, *self.cfg.view_pitch_limits_deg))
         ctrls = {side: self._filtered(side, payload.get(side)) for side in SIDES}
 
         home_all = False
@@ -237,6 +247,7 @@ class WholeBodyTeleop:
         commands["base_mode"], commands["base_velocity"] = self._update_base(ctrls)
         commands["episode"] = self._update_episode_buttons(ctrls)
         commands["neck"] = self._update_neck(head, robot_state, dt)
+        commands["view_pitch_deg"] = self.view_pitch_deg
         commands["lift_target"] = self._update_lift(head, robot_state, dt)
         self.lift_manual = self._update_lift_buttons(ctrls)
         commands["lift_manual"] = self.lift_manual
@@ -498,6 +509,7 @@ class WholeBodyTeleop:
             self._neck_yaw0 = yaw
         f = head["R"] @ np.array([0.0, 0.0, -1.0])
         pitch = math.asin(float(np.clip(f[1], -1.0, 1.0)))  # against the horizon, up positive
+        pitch += math.radians(self.view_pitch_deg)
 
         lim = cfg.neck_limits_deg
         pan = float(np.clip(cfg.neck_pan_sign * math.degrees(_wrap(yaw - self._neck_yaw0)) + cfg.neck_pan_offset_deg,

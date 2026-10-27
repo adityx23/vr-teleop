@@ -11,14 +11,60 @@ ZMQ PUB, bound on the Pi at `*:5558` (`--episode-port`). Every message is two fr
 
 | Topic | When | JSON |
 |---|---|---|
-| `episode/signal` | episode start | `{timestamp, active: true, episode_id, task, operator?, notes?, ...}` |
-| `episode/signal` | episode end | `{timestamp, active: false, success, episode_id, num_frames}` |
-| `teleop/episode_result` | episode end | `{timestamp, result: "success" \| "fail", episode_id}` |
+| `episode/signal` | episode start | `{timestamp, active: true, episode_id, task, operator?, notes?, ...}` + [cycle fields](#cycles-orin---pi) |
+| `episode/signal` | episode end | `{timestamp, active: false, success, episode_id, num_frames}` + `cycle`, `subtask_index` in a cycle |
+| `teleop/episode_result` | episode end | `{timestamp, result: "success" \| "fail", episode_id}` + `cycle`, `subtask_index` in a cycle |
 | `teleop/episode` | 30 Hz while an episode is open | one frame, below |
 
 `episode_id` is `YYYY-MM-DD--HH-MM-SS` (Pi local time at start). Frames are only sent
 between a start and its end. Right stick click starts / ends as success, left stick click
 ends as fail, with teleop on or off (so policy rollouts can be marked too).
+
+## Cycles (Orin -> Pi)
+
+A cycle is a self-resetting list of subtasks (open fridge, grab soda, close fridge, open
+fridge, place soda, close fridge), each attempt recorded as its own episode. The Orin
+collector picks the cycle and announces it; the Pi, which gets the stick clicks, steps
+through it (`server/cycles.py`). What the Orin collector has to change: [ORIN_CYCLES.md](ORIN_CYCLES.md).
+
+The collector binds a ZMQ PUB (default `*:5559`) and sends, about once a second for as long
+as it runs, `[b"collection/cycle", JSON]`:
+
+```json
+{"timestamp": 1793122155.2, "cycle": "fridge_soda", "run_id": "3f9c0a1b2d4e",
+ "subtasks": ["open the fridge", "grab the soda", "close the fridge",
+              "open the fridge", "place the soda in the fridge", "close the fridge"]}
+```
+
+`subtasks` entries may also be `{"task": "...", ...}`. `run_id` is new each time the
+collector starts. The bridge connects to it with `--cycle-source host:port` (YOR's
+`whole_body_teleop.py`: `CYCLE_SOURCE` in `robot/config.py`, default `ORIN_IP:5559`).
+`tools/announce_cycle.py` is a stand-in collector for testing. Until a cycle is heard, every
+episode gets `--task` as before.
+
+Clicks in a cycle:
+
+| Click | No episode open | Episode open |
+|---|---|---|
+| right | start the current subtask | end as success, move to the next subtask (wraps to the first: one more lap) |
+| left | go back one subtask | end as fail; the next right click retries the same subtask |
+
+So to pause, end a subtask as a success and leave the next one un-started (or start it and
+fail it; those short fails are kept and can be filtered out later, as can a ~1 s success
+from double-clicking forward after going back too far). A different cycle announced
+mid-episode takes effect when that episode ends. The current subtask is saved per cycle name
+in `teleop_data/cycle_state.json`, so a bridge or collector restart resumes where the scene
+is (same name and same subtask list; otherwise it starts at the first subtask).
+
+Extra `episode/signal` start fields in a cycle (also in the `.yep` metadata):
+
+| Field | Meaning |
+|---|---|
+| `task` | the subtask's prompt (replaces `--task`) |
+| `cycle`, `cycle_run_id` | the announced cycle name and `run_id` |
+| `subtask_index`, `num_subtasks` | 0-based position in the cycle, and its length |
+| `subtask_attempt` | 1 for the first try at this subtask since reaching it, +1 per retry |
+| `cycle_lap` | completed passes through the whole cycle |
 
 ## Frame (`teleop/episode`)
 
@@ -64,6 +110,7 @@ why, and the error is `null` exactly when the value is present.
 | `lift_cmd` | int | last manual lift command: +1 up, -1 down, 0 stop | commanded |
 | `neck_deg` | float[2] \| null | `[pan, tilt]`, deg | measured |
 | `neck_cmd_deg` | float[2] \| null | `[pan, tilt]` goal, deg | commanded |
+| `view_pitch_deg` | float \| null | headset view tilt the operator set (right stick left/right, teleop off), added to the head pitch before it becomes the neck tilt; − = robot looks further down than the operator, deg | setting |
 | `base_pose`, `cam_pose`, `zed_timestamp`, `zed_age_s` | null | always `null` here: the Orin has the ZED and joins it by timestamp | |
 
 `enc_vel`, `neck_deg` and `{side}_ee` have no `_error` partner yet: `null`

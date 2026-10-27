@@ -358,6 +358,24 @@ def test_neck_follows_head():
     assert abs(out["neck"]["tilt"] + 20) < 1e-6
 
 
+def test_view_pitch_offsets_neck_tilt():
+    tele, clk = make(neck_max_speed_dps=1e6), Clock()
+    run(tele, clk, payload())  # zero
+    p = payload()
+    p["view_pitch_deg"] = -30.0  # looking straight ahead -> robot looks 30 deg down
+    out = run(tele, clk, p)
+    assert abs(out["neck"]["tilt"] + 30) < 1e-6 and out["view_pitch_deg"] == -30.0
+    p = payload(head_q=pitch_quat(10))
+    p["view_pitch_deg"] = -30.0
+    assert abs(run(tele, clk, p)["neck"]["tilt"] + 20) < 1e-6
+    p = payload()
+    p["view_pitch_deg"] = -500.0  # clamped to view_pitch_limits_deg, then the neck limit
+    out = run(tele, clk, p)
+    assert out["view_pitch_deg"] == -60.0 and out["neck"]["tilt"] == -45.0
+    out = run(tele, clk, payload())  # payload without the field: keep the last value
+    assert out["view_pitch_deg"] == -60.0
+
+
 def test_neck_limits_and_rezero_on_enable():
     tele, clk = make(neck_max_speed_dps=1e6), Clock()
     run(tele, clk, payload())

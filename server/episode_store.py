@@ -41,6 +41,7 @@ QUANTA = [
     ("ee", 1e-6),          # m and quaternion components
     ("vel", 1e-5),         # m/s, rad/s
     ("neck", 1e-3),        # deg
+    ("view_pitch", 1e-2),  # deg, headset view offset
     ("gripper", 1e-4),     # 0..1
     ("lift", 1e-5),        # m
 ]

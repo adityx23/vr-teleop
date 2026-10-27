@@ -22,7 +22,11 @@ Teleop starts OFF. Controls:
   B + Y (one per hand)        base mode on/off;  left stick drive, right stick turn
   head                  neck pan/tilt; straight ahead re-zeroes each time teleop turns on
   right stick click     episode start / end as success;  left stick click  end as fail
+                        (in a cycle from the Orin: success moves to the next subtask; left click
+                        with no episode open goes back one subtask)
   left stick (teleop off)  move the headset HUD up/down
+  right stick up/down   IPD;  left/right (teleop off)  view tilt: the robot looks that much further
+                        down (or up) than your head, so you don't crane your neck at a table
   trigger               that arm's gripper: 0 open .. full pull = closed
   A + Y (hold)          lift down;  X + B (hold) lift up;  release stops
 The lift's automatic head-height retargeting stays off. --gripper-sides picks which triggers
@@ -87,6 +91,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # this directory, however it's imported
 
 import server as vr_server  # noqa: E402  (server/server.py)
+from cycles import CycleTracker  # noqa: E402
 from whole_body import SIDES, WholeBodyConfig, WholeBodyTeleop, _heading  # noqa: E402
 import quat  # noqa: E402
 
@@ -96,10 +101,12 @@ DEFAULT_EPISODE_PORT = int(os.environ.get("EPISODE_PUB_PORT", "5558"))
 EPISODE_SIGNAL_TOPIC = "episode/signal"
 EPISODE_RESULT_TOPIC = "teleop/episode_result"
 EPISODE_FRAME_TOPIC = "teleop/episode"
+CYCLE_TOPIC = "collection/cycle"  # Orin -> Pi: which cycle of subtasks is being collected (cycles.py)
+DEFAULT_CYCLE_SOURCE = os.environ.get("CYCLE_SOURCE")  # Orin collector's host:port, e.g. 192.168.123.117:5559
 FRAME_HZ_DEFAULT = 30.0
 # Saved per frame in the Pi-side .yep file (everything numeric in a frame).
 FRAME_FIELDS = ["timestamp", "teleop_on", "base_vel", "enc_vel", "neck_deg", "neck_cmd_deg", "lift_height",
-                "lift_cmd", "lift_homed"] + [
+                "lift_cmd", "lift_homed", "view_pitch_deg"] + [
     f"{side}_{k}" for side in ("left", "right") for k in
     ("ee", "joints", "joints_cmd", "gripper", "gripper_cmd", "ee_target", "ik_ok")]
 ERROR_FIELDS = ["lift_height_error"] + [f"{side}_{k}_error" for side in ("left", "right")
@@ -549,10 +556,12 @@ class EpisodePublisher:
     Pi-side copy of each episode (format: module docstring). Signals come from the control
     thread, frames from FrameStreamer's; one lock covers the socket and the episode state."""
 
-    def __init__(self, host, port, meta, episode_dir=None):
+    def __init__(self, host, port, meta, episode_dir=None, cycle=None):
         import zmq
 
         self.meta = {k: v for k, v in meta.items() if v is not None}
+        self.cycle = cycle  # cycles.CycleTracker, or None: every episode gets --task
+        self.episode_meta = {}  # this episode's cycle fields (cycle.episode_meta() at its start)
         self.episode_dir = Path(episode_dir) if episode_dir else None
         self.ctx = zmq.Context()
         self.sock = self.ctx.socket(zmq.PUB)
@@ -586,8 +595,16 @@ class EpisodePublisher:
         elif event == "fail":
             if self.active:
                 self.end(success=False)
+            elif self.cycle is not None and self.cycle.active:
+                with self.lock:
+                    self.cycle.back()
             else:
                 log.info("Episode: left stick click ignored (no episode open)")
+
+    def announce_cycle(self, msg):
+        """CycleListener thread: one collection/cycle message from the Orin."""
+        with self.lock:
+            self.cycle.announce(msg, time.monotonic(), episode_open=self.active)
 
     def start(self):
         episode_id = datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
@@ -595,14 +612,30 @@ class EpisodePublisher:
             if episode_id == self.last_id:
                 log.warning("Episode NOT started: %s was just used (pressed twice within a second?)", episode_id)
                 return
+            self.episode_meta = {}
+            if self.cycle is not None and self.cycle.active:
+                self.cycle.started()
+                self.episode_meta = self.cycle.episode_meta()
             self.episode_id = self.last_id = episode_id
             self.started_mono = time.monotonic()
             self.started_at = time.time()
             self.frames = []
             self.errors = []
             self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": self.started_at, "active": True,
-                                                 "episode_id": episode_id, **self.meta})
-        log.info("Episode STARTED %s (task %r)", episode_id, self.meta.get("task"))
+                                                 "episode_id": episode_id, **self.meta, **self.episode_meta})
+        log.info("Episode STARTED %s (task %r)%s", episode_id, self.task,
+                 " -- cycle {cycle!r} subtask {i}/{n}, attempt {subtask_attempt}".format(
+                     i=self.episode_meta["subtask_index"] + 1, n=self.episode_meta["num_subtasks"],
+                     **self.episode_meta) if self.episode_meta else "")
+
+    @property
+    def task(self):
+        """The open (or next) episode's prompt: its subtask in a cycle, else --task."""
+        if self.active and self.episode_meta:
+            return self.episode_meta["task"]
+        if self.cycle is not None and self.cycle.active:
+            return self.cycle.subtask
+        return self.meta.get("task")
 
     def add_frame(self, frame):
         """FrameStreamer: stamp, publish and keep one frame. False if no episode is open."""
@@ -626,16 +659,22 @@ class EpisodePublisher:
                 return
             now = time.time()
             episode_id, frames, duration = self.episode_id, self.frames, time.monotonic() - self.started_mono
-            meta = {**self.meta, "episode_id": episode_id, "success": bool(success),
+            cycle_fields = {k: self.episode_meta[k] for k in ("cycle", "subtask_index") if k in self.episode_meta}
+            meta = {**self.meta, **self.episode_meta, "episode_id": episode_id, "success": bool(success),
                     "started_at": self.started_at, "ended_at": now, "num_frames": len(frames),
                     "frame_hz": self.frame_hz, "errors": self.errors}
             self._publish(EPISODE_SIGNAL_TOPIC, {"timestamp": now, "active": False, "success": bool(success),
-                                                 "episode_id": episode_id, "num_frames": len(frames)})
+                                                 "episode_id": episode_id, "num_frames": len(frames),
+                                                 **cycle_fields})
             self._publish(EPISODE_RESULT_TOPIC, {"timestamp": now, "result": "success" if success else "fail",
-                                                 "episode_id": episode_id})
+                                                 "episode_id": episode_id, **cycle_fields})
             self.episode_id = None
             self.started_mono = None
             self.frames = []
+            if self.cycle is not None and self.episode_meta:
+                self.cycle.ended(success)
+            if self.cycle is not None:
+                self.cycle.apply_pending()  # a cycle the collector switched to mid-episode
         log.info("Episode ENDED %s -- %s (%.1f s, %d frames)", episode_id, "success" if success else "FAIL",
                  duration, len(frames))
         if self.episode_dir is not None:
@@ -657,10 +696,12 @@ class EpisodePublisher:
     def hud(self):
         """teleop_state.recording for the headset HUD (static/main.js)."""
         with self.lock:
+            now = time.monotonic()
+            cycle = self.cycle.hud(now, self.active) if self.cycle is not None else None
             if not self.active:
-                return {"active": False}
-            return {"active": True, "episode": self.episode_id, "task": self.meta.get("task"),
-                    "elapsed_s": round(time.monotonic() - self.started_mono, 1), "frames": len(self.frames)}
+                return {"active": False, "task": self.task, "cycle": cycle}
+            return {"active": True, "episode": self.episode_id, "task": self.task, "cycle": cycle,
+                    "elapsed_s": round(now - self.started_mono, 1), "frames": len(self.frames)}
 
     def close(self):
         if self.active:
@@ -670,6 +711,42 @@ class EpisodePublisher:
             w.join()  # finish writing episode files before exit
         self.sock.close(linger=500)  # give the end signal time to go out
         self.ctx.term()
+
+
+class CycleListener:
+    """Subscribes to the Orin collector's collection/cycle announcements (sent about once a
+    second while it runs) and hands each one to EpisodePublisher."""
+
+    def __init__(self, episodes, source):
+        self.episodes, self.source = episodes, source
+        self.stop = threading.Event()
+        self.bad = 0
+
+    def run(self):
+        import zmq
+
+        ctx = zmq.Context()  # its own, so the publisher's shutdown can't pull it out from under us
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.SUBSCRIBE, CYCLE_TOPIC.encode())
+        sock.connect(f"tcp://{self.source}")
+        log.info("Waiting for the collector's cycle on tcp://%s (%s)", self.source, CYCLE_TOPIC)
+        try:
+            while not self.stop.is_set():
+                try:
+                    topic, body = sock.recv_multipart()
+                except zmq.Again:
+                    continue
+                try:
+                    self.episodes.announce_cycle(json.loads(body))
+                except ValueError as e:  # bad JSON or a malformed cycle: keep the last good one
+                    self.bad += 1
+                    if self.bad == 1 or self.bad % 60 == 0:
+                        log.warning("Bad %s message (%d so far): %s", CYCLE_TOPIC, self.bad, e)
+        finally:
+            sock.close()
+            ctx.term()
 
 
 class FrameStreamer:
@@ -725,7 +802,8 @@ class FrameStreamer:
              "teleop_on": bool(cmds and cmds["enabled"]), "neck_deg": s.get("neck_deg"),
              "neck_cmd_deg": s.get("neck_cmd_deg"), "lift_height": s.get("lift_height"),
              "lift_height_error": s.get("lift_height_error"), "lift_cmd": s.get("lift_cmd"),
-             "lift_homed": bool(s.get("lift_homed")), "lift_ref": s.get("lift_ref")}
+             "lift_homed": bool(s.get("lift_homed")), "lift_ref": s.get("lift_ref"),
+             "view_pitch_deg": None if cmds is None else cmds.get("view_pitch_deg")}
         for side in SIDES:
             arm = (cmds or {}).get("arms", {}).get(side) or {}
             f[f"{side}_ee"] = s.get(f"{side}_ee")
@@ -947,6 +1025,9 @@ class Runner:
         out = [f"=> {self.status['state']}"]
         if self.episodes is not None and self.episodes.active:
             out.append(f"REC {self.episodes.episode_id}")
+        c = self.episodes.hud().get("cycle") if self.episodes is not None else None
+        if c:
+            out.append(f"cycle {c['name']} {c['idx'] + 1}/{c['n']} {c['subtask']!r}{' (collector gone)' if c['stale'] else ''}")
         for side in SIDES:
             a = commands["arms"][side]
             anchor = robot_state.get(f"{side}_ee")
@@ -965,10 +1046,13 @@ class Runner:
 
 
 def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPISODE_HOST,
-         episode_port=DEFAULT_EPISODE_PORT, episode_dir="episodes", gripper_sides=GRIPPER_SIDES):
+         episode_port=DEFAULT_EPISODE_PORT, episode_dir="episodes", gripper_sides=GRIPPER_SIDES,
+         cycle_source=DEFAULT_CYCLE_SOURCE, cycle_state=None):
     """default_video / neck_calib: the YOR launcher passes the Orin address and
     robot/neck/neck_calibration.json (its "home_deg" is the neck's straight-ahead).
     episode_host / episode_port: where the episode signals are published.
+    cycle_source: host:port the Orin collector announces its cycle on (None: --task only).
+    cycle_state: JSON file remembering each cycle's current subtask across restarts.
     gripper_sides: default for --gripper-sides (arms whose trigger drives a gripper)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="don't connect to the robot; print commands only")
@@ -1019,6 +1103,11 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
     ep.add_argument("--operator", help="who is operating")
     ep.add_argument("--notes", help="free-form notes")
     ep.add_argument("--meta-file", help="JSON file of extra episode metadata; the flags above override it")
+    ep.add_argument("--cycle-source", default=cycle_source,
+                    help="host:port of the Orin collector's collection/cycle announcements; once one arrives, "
+                         "each episode's task is the cycle's current subtask ('none' = off; default %(default)s)")
+    ep.add_argument("--cycle-state", default=cycle_state,
+                    help="JSON file remembering each cycle's current subtask (default %(default)s)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1057,12 +1146,20 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
 
         try:
             save_dir = None if (args.no_save or args.frame_hz <= 0) else args.episode_dir
-            episodes = EpisodePublisher(args.episode_host, args.episode_port, load_episode_meta(args), save_dir)
+            use_cycles = bool(args.cycle_source) and args.cycle_source.lower() != "none"
+            cycle = CycleTracker(args.cycle_state) if use_cycles else None
+            episodes = EpisodePublisher(args.episode_host, args.episode_port, load_episode_meta(args), save_dir,
+                                        cycle=cycle)
         except zmq.ZMQError as e:
             log.error("Episode publisher NOT started (port %s: %s) -- is vr_teleop.py still running? "
                       "Stick clicks will do nothing.", args.episode_port, e)
         if episodes is not None and not episodes.meta.get("task"):
-            log.warning("No --task given: episode starts will carry no task prompt")
+            log.warning("No --task given: episode starts will carry no task prompt%s",
+                        " until the collector announces a cycle" if episodes.cycle is not None else "")
+    cycles = None
+    if episodes is not None and episodes.cycle is not None:
+        cycles = CycleListener(episodes, args.cycle_source)
+        threading.Thread(target=cycles.run, daemon=True).start()
 
     runner = Runner(args.rate, args.print_period, cfg, link, episodes)
     control = threading.Thread(target=runner.control_loop, daemon=True)
@@ -1089,6 +1186,8 @@ def main(default_video=DEFAULT_VIDEO, neck_calib=None, episode_host=DEFAULT_EPIS
         vr_server.run(runner.on_payload, runner.on_connect, runner.on_disconnect, cameras=False,
                       default_video=video, port=args.port, monitor=runner.monitor_state)
     finally:
+        if cycles is not None:
+            cycles.stop.set()
         if frames is not None:
             frames.stop.set()
         runner.stop.set()
