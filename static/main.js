@@ -480,9 +480,9 @@ function hapticPulse(hand, intensity, durationMs) {
 
 // ---------- Halo HUD ----------
 // Head-locked status ring around the edge of view; the centre stays clear for
-// the video. Panels: top (mode, links, REC/IPD/view tilt), bottom (base motion, cycle
-// subtask or task -- each only when it has data), lift height just below the camera
-// image, plus a pulsing alert banner. (No left/right arm panels: arm state shows as the
+// the video. Panels: top (mode, links, REC/IPD/view tilt), a task strip under it (cycle
+// subtask, or the task while recording), lift height just below the camera image, plus a
+// pulsing alert banner. No base display: base mode shows in the mode chip. (No left/right arm panels: arm state shows as the
 // mode chip and alerts; a controller's marker hides while its arm is clutched.) Each panel is a small canvas texture, redrawn
 // only when what it shows changes (checked at HUD_RATE_HZ).
 // Robot fields come from teleop_state.robot (robot/whole_body_teleop.py
@@ -696,53 +696,29 @@ const topPanel = makeHudPanel({
   },
 });
 
-// --- bottom: base motion, and the cycle's current subtask (always, once the Orin
-// collector has announced a cycle) or else the task prompt while recording
-const bottomPanel = makeHudPanel({
-  px: [1024, 200], widthM: 0.8, offset: new THREE.Vector3(0, -0.4, -HUD_DIST),
-  view: ({ s, r }) => {
-    const base = s && String(s.state).includes("BASE") && r && r.base_vel ? r.base_vel : null;
+// --- task strip, just under the top bar: the cycle's current subtask (always, once the
+// Orin collector has announced a cycle), or else the task prompt while recording
+const taskPanel = makeHudPanel({
+  px: [1024, 56], widthM: 0.9, offset: new THREE.Vector3(0, 0.365, -HUD_DIST),
+  view: ({ s }) => {
     const rec = s && s.recording && s.recording.active ? s.recording : null;
     const cy = s && s.recording && s.recording.cycle ? s.recording.cycle : null;
     return {
       cycle: cy ? { k: cy.idx + 1, n: cy.n, sub: String(cy.subtask).slice(0, 52), state: cy.state, stale: cy.stale } : null,
-      base: base ? base.map((x) => Math.round(x * 100) / 100) : null,
       task: rec && rec.task ? String(rec.task).slice(0, 70) : null,
     };
   },
   draw: (ctx, W, H, v) => {
-    // base: direction dial (robot x forward = up, y left = left) + numbers, only in base mode
-    const dx = 690, dy = 92, dr = 52;
-    if (v.base) {
-      glowPath(ctx, C.dim, 2, () => ctx.arc(dx, dy, dr, 0, 2 * Math.PI));
-      glowText(ctx, "BASE", W - 60, 46, { size: 24, color: C.amber, align: "right" });
-      const [vx, vy, wz] = v.base;
-      const speed = Math.hypot(vx, vy);
-      if (speed > 0.005) {
-        const k = Math.min(1, speed / 0.3) * (dr - 6) / speed;
-        glowPath(ctx, C.amber, 5, () => {
-          ctx.moveTo(dx, dy);
-          ctx.lineTo(dx - vy * k, dy - vx * k);
-        });
-      }
-      if (Math.abs(wz) > 0.01) { // turn: arc along the dial, counter-clockwise = left
-        const a = Math.min(Math.PI, Math.abs(wz) * 1.5);
-        glowPath(ctx, C.amber, 4, () => ctx.arc(dx, dy, dr + 10, -Math.PI / 2, -Math.PI / 2 - Math.sign(wz) * a, wz > 0));
-      }
-      glowText(ctx, `${speed.toFixed(2)} M/S`, W - 60, 92, { size: 26, color: C.text, align: "right" });
-      glowText(ctx, `${sgn(wz)}${Math.abs(wz).toFixed(2)} RAD/S`, W - 60, 128, { size: 22, color: C.dim, align: "right" });
-    }
-
     if (v.cycle) {
       const c = v.cycle;
       const [label, color] = c.state === "rec" ? ["● REC", C.red] : c.state === "retry" ? ["RETRY", C.amber] : ["READY", C.green];
-      scrim(ctx, 40, 160, W - 80, 36, 10);
-      glowText(ctx, `${c.k}/${c.n}`, 60, 178, { size: 20, color: C.dim });
-      glowText(ctx, c.sub.toUpperCase(), W / 2, 178, { size: 20, color: c.stale ? C.dim : C.text, align: "center", weight: 700 });
-      glowText(ctx, label, W - 60, 178, { size: 20, color, align: "right", weight: 700 });
+      scrim(ctx, 8, 6, W - 16, H - 12, 10);
+      glowText(ctx, `${c.k}/${c.n}`, 32, H / 2, { size: 24, color: C.dim });
+      glowText(ctx, c.sub.toUpperCase(), W / 2, H / 2, { size: 24, color: c.stale ? C.dim : C.text, align: "center", weight: 700 });
+      glowText(ctx, label, W - 32, H / 2, { size: 24, color, align: "right", weight: 700 });
     } else if (v.task) {
-      scrim(ctx, 40, 160, W - 80, 36, 10);
-      glowText(ctx, `TASK  ${v.task.toUpperCase()}`, W / 2, 178, { size: 20, color: C.text, align: "center", weight: 400 });
+      scrim(ctx, 8, 6, W - 16, H - 12, 10);
+      glowText(ctx, `TASK  ${v.task.toUpperCase()}`, W / 2, H / 2, { size: 22, color: C.text, align: "center", weight: 400 });
     }
   },
 });
