@@ -412,43 +412,15 @@ const floorGrid = new THREE.GridHelper(6, 12, 0x3a4a5a, 0x222a33);
 scene.add(floorGrid);
 
 // ---------- Controllers ----------
-function makeControllerMesh(color) {
-  const geo = new THREE.ConeGeometry(0.02, 0.08, 16);
-  geo.rotateX(-Math.PI / 2);
-  const mat = new THREE.MeshStandardMaterial({ color });
-  return new THREE.Mesh(geo, mat);
-}
-
-// Small enable-state indicator sphere per controller: dim gray = disabled,
-// green = arm enabled, red = warning (e.g. dead-man's switch tripped).
-// The whole controller marker (cone + sphere) is hidden while that arm is clutched.
-function makeIndicatorMesh() {
-  const geo = new THREE.SphereGeometry(0.015, 12, 12);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x555555, emissive: 0x222222 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set(0, 0.05, 0);
-  return mesh;
-}
-
-const INDICATOR_COLORS = { off: 0x555555, on: 0x33ff66, warning: 0xff3333 };
-
+// Controllers are tracked (for haptics) but not drawn: no markers over the video.
 const controllers = { left: null, right: null };
 
 for (let i = 0; i < 2; i++) {
   const controller = renderer.xr.getController(i);
   scene.add(controller);
 
-  const grip = renderer.xr.getControllerGrip(i);
-  scene.add(grip);
-
   controller.addEventListener("connected", (event) => {
-    const handedness = event.data.handedness; // 'left' | 'right'
-    const color = handedness === "left" ? 0x3ddc84 : 0xff6b6b;
-    const mesh = makeControllerMesh(color);
-    grip.add(mesh);
-    const indicator = makeIndicatorMesh();
-    grip.add(indicator);
-    controllers[handedness] = { controller, grip, inputSource: event.data, indicator };
+    controllers[event.data.handedness] = { controller, inputSource: event.data }; // 'left' | 'right'
   });
 
   controller.addEventListener("disconnected", () => {
@@ -458,13 +430,6 @@ for (let i = 0; i < 2; i++) {
       }
     }
   });
-}
-
-function setIndicator(hand, state) {
-  const entry = controllers[hand];
-  if (!entry) return;
-  entry.indicator.material.color.setHex(INDICATOR_COLORS[state]);
-  entry.indicator.material.emissive.setHex(INDICATOR_COLORS[state]);
 }
 
 function hapticPulse(hand, intensity, durationMs) {
@@ -482,8 +447,8 @@ function hapticPulse(hand, intensity, durationMs) {
 // Head-locked status ring around the edge of view; the centre stays clear for
 // the video. Panels: top (mode, links, REC/IPD/view tilt), a task strip under it (cycle
 // subtask, or the task while recording), lift height just below the camera image, plus a
-// pulsing alert banner. No base display: base mode shows in the mode chip. (No left/right arm panels: arm state shows as the
-// mode chip and alerts; a controller's marker hides while its arm is clutched.) Each panel is a small canvas texture, redrawn
+// pulsing alert banner. No base display, arm panels or controller markers: base and arm
+// state show in the mode chip and alerts. Each panel is a small canvas texture, redrawn
 // only when what it shows changes (checked at HUD_RATE_HZ).
 // Robot fields come from teleop_state.robot (robot/whole_body_teleop.py
 // RobotLink.hud()) and teleop_state.recording; both optional -- whatever the
@@ -850,8 +815,6 @@ function handleTeleopState(msg) {
   for (const hand of ["left", "right"]) {
     const isEnabled = !!msg.arm_enabled[hand];
     const wasEnabled = !!prevEnabled[hand];
-    setIndicator(hand, isEnabled ? "on" : "off");
-    if (controllers[hand]) controllers[hand].grip.visible = !isEnabled; // clutched: marker out of the way
     if (isEnabled && !wasEnabled) hapticPulse(hand, 0.3, 80);
     if (!isEnabled && wasEnabled) {
       hapticPulse(hand, 0.5, 60);
@@ -862,7 +825,6 @@ function handleTeleopState(msg) {
   for (const w of msg.warnings || []) {
     const hand = w.startsWith("left") ? "left" : w.startsWith("right") ? "right" : null;
     if (hand) {
-      setIndicator(hand, "warning");
       hapticPulse(hand, 0.9, 200);
     }
   }
