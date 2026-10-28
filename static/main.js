@@ -661,15 +661,16 @@ const topPanel = makeHudPanel({
   },
 });
 
-// --- task strip, just under the top bar: the cycle's current subtask (always, once the
-// Orin collector has announced a cycle), or else the task prompt while recording
+// --- task strip, just under the top bar: the cycle's current subtask and how many full
+// cycles are done (always, once the Orin collector has announced a cycle), or else the
+// task prompt while recording
 const taskPanel = makeHudPanel({
   px: [1024, 56], widthM: 0.9, offset: new THREE.Vector3(0, 0.365, -HUD_DIST),
   view: ({ s }) => {
     const rec = s && s.recording && s.recording.active ? s.recording : null;
     const cy = s && s.recording && s.recording.cycle ? s.recording.cycle : null;
     return {
-      cycle: cy ? { k: cy.idx + 1, n: cy.n, sub: String(cy.subtask).slice(0, 52), state: cy.state, stale: cy.stale } : null,
+      cycle: cy ? { k: cy.idx + 1, n: cy.n, lap: cy.lap || 0, sub: String(cy.subtask).slice(0, 44), state: cy.state, stale: cy.stale } : null,
       task: rec && rec.task ? String(rec.task).slice(0, 70) : null,
     };
   },
@@ -678,7 +679,7 @@ const taskPanel = makeHudPanel({
       const c = v.cycle;
       const [label, color] = c.state === "rec" ? ["● REC", C.red] : c.state === "retry" ? ["RETRY", C.amber] : ["READY", C.green];
       scrim(ctx, 8, 6, W - 16, H - 12, 10);
-      glowText(ctx, `${c.k}/${c.n}`, 32, H / 2, { size: 24, color: C.dim });
+      glowText(ctx, `${c.k}/${c.n}  CYCLES ${c.lap}`, 28, H / 2, { size: 20, color: C.dim });
       glowText(ctx, c.sub.toUpperCase(), W / 2, H / 2, { size: 24, color: c.stale ? C.dim : C.text, align: "center", weight: 700 });
       glowText(ctx, label, W - 32, H / 2, { size: 24, color, align: "right", weight: 700 });
     } else if (v.task) {
